@@ -1,5 +1,18 @@
 # rbtree-lab: project rules
 
+## Project Overview
+- This project implements a Red-Black Tree data structure in C (C23).
+- Tree nodes have C-string key values and are compared with `strcmp`.
+- Memory management is of the highest priority. Use C best practices
+to prevent memory leaks, double frees, or use-after-free failures.
+
+## Preferences
+- Include a one-line comment whenever there is a transfer of node ownership
+describing the change.
+- When making changes that allocate or free memory, explicitly name what
+variables were allocated/freed and which allocations survive the change
+(i.e., have yet to be freed) in your response.
+
 ## Commands
 - Build & unit tests: ‘make test‘
 - Sanitizers: ‘make asan‘ Valgrind: ‘make memcheck‘
