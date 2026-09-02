@@ -9,7 +9,7 @@ all: $(BIN) $(FUZZBIN)
 
 $(BIN): $(SRC) $(TSRC) include/rbtree.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) $(SRC) $(TSRC) -o $@
+	$(CC) $(CFLAGS) $(TSRC) -o $@
 
 $(FUZZBIN): $(SRC) tests/fuzz.c include/rbtree.h
 	@mkdir -p build
