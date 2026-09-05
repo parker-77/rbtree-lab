@@ -51,16 +51,22 @@ cleanup_node:
     return n != NULL && n->color == RED;
 }
 
-/* TODO: not yet implemented. */
+/* Pure structural relink: n's right child becomes the new subtree root, its
+ * old left child is reattached under n. Does not touch color. */
 [[maybe_unused]] static struct rb_node *rotate_left(struct rb_node *n) {
-    (void)n;
-    return NULL;
+    struct rb_node *r = n->right;
+    n->right = r->left;
+    r->left = n;
+    return r;
 }
 
-/* TODO: not yet implemented. */
+/* Mirror of rotate_left: n's left child becomes the new subtree root, its
+ * old right child is reattached under n. Does not touch color. */
 [[maybe_unused]] static struct rb_node *rotate_right(struct rb_node *n) {
-    (void)n;
-    return NULL;
+    struct rb_node *l = n->left;
+    n->left = l->right;
+    l->right = n;
+    return l;
 }
 
 /* Restores the red-black invariants at n given a possible red-red violation
