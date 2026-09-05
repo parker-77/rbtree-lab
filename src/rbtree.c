@@ -45,15 +45,22 @@ cleanup_node:
     return NULL;
 }
 
+/* Compares key against n->key using strcmp's convention: negative means key
+ * belongs left of n, positive means right, zero means key matches n. Shared
+ * directional check for insert/delete traversal. */
+static int key_compare(const struct rb_node *n, const char *key) {
+    return strcmp(key, n->key);
+}
+
 /* Treats an absent child (NULL) as black, matching a valid tree's implicit
  * black leaves; avoids needing a sentinel node. */
-[[maybe_unused]] static bool is_red(const struct rb_node *n) {
+static bool is_red(const struct rb_node *n) {
     return n != NULL && n->color == RED;
 }
 
 /* Pure structural relink: n's right child becomes the new subtree root, its
  * old left child is reattached under n. Does not touch color. */
-[[maybe_unused]] static struct rb_node *rotate_left(struct rb_node *n) {
+static struct rb_node *rotate_left(struct rb_node *n) {
     struct rb_node *r = n->right;
     n->right = r->left;
     r->left = n;
@@ -62,7 +69,7 @@ cleanup_node:
 
 /* Mirror of rotate_left: n's left child becomes the new subtree root, its
  * old right child is reattached under n. Does not touch color. */
-[[maybe_unused]] static struct rb_node *rotate_right(struct rb_node *n) {
+static struct rb_node *rotate_right(struct rb_node *n) {
     struct rb_node *l = n->left;
     n->left = l->right;
     l->right = n;
@@ -70,9 +77,58 @@ cleanup_node:
 }
 
 /* Restores the red-black invariants at n given a possible red-red violation
- * between n and its just-modified child. TODO: currently a no-op
- * pass-through; needs the is_red/rotate_left/rotate_right pattern match. */
-[[maybe_unused]] static struct rb_node *fixup(struct rb_node *n) {
+ * between one of n's children and that child's same-side child. Only ever
+ * does real work when n itself is black: if n is red, the pre-existing tree
+ * invariant guarantees both of n's children were black before this insert
+ * touched one of them, so any violation at this depth is caught one level up
+ * instead (see the "every other level" fixup cadence). When it does fire, the
+ * restructured subtree root always comes back red, which is why the caller
+ * one level up must run this same check again.
+ *
+ * A red uncle (n's other child) is checked first: if both of n's children
+ * are red and one of them has a red child of its own, recoloring both
+ * children black and n red clears the violation without any rotation, at
+ * the cost of shifting a (possibly new) violation up to n's own level for
+ * the caller one level up to handle. Only once the uncle is black (or
+ * absent) does a violation require the rotation cases below. */
+static struct rb_node *insert_fixup(struct rb_node *n) {
+    if (is_red(n)) {
+        return n;
+    }
+
+    if (is_red(n->left) && is_red(n->right) &&
+        (is_red(n->left->left) || is_red(n->left->right) ||
+         is_red(n->right->left) || is_red(n->right->right))) { /* red uncle */
+        n->left->color = BLACK;
+        n->right->color = BLACK;
+        n->color = RED;
+        return n;
+    }
+
+    if (is_red(n->left) && is_red(n->left->left)) { /* left-left */
+        n = rotate_right(n);
+        n->color = RED;
+        n->left->color = BLACK;
+        n->right->color = BLACK;
+    } else if (is_red(n->left) && is_red(n->left->right)) { /* left-right */
+        n->left = rotate_left(n->left);
+        n = rotate_right(n);
+        n->color = RED;
+        n->left->color = BLACK;
+        n->right->color = BLACK;
+    } else if (is_red(n->right) && is_red(n->right->right)) { /* right-right */
+        n = rotate_left(n);
+        n->color = RED;
+        n->left->color = BLACK;
+        n->right->color = BLACK;
+    } else if (is_red(n->right) && is_red(n->right->left)) { /* right-left */
+        n->right = rotate_right(n->right);
+        n = rotate_left(n);
+        n->color = RED;
+        n->left->color = BLACK;
+        n->right->color = BLACK;
+    }
+
     return n;
 }
 
@@ -84,9 +140,29 @@ static struct rb_node *insert_rec(struct rb_node *n, const char *key,
     if (n == NULL) {
         return new_node(key, value);
     }
-    /* TODO: strcmp against n->key, recurse into the correct side, reattach
-     * the (possibly restructured) child, then return fixup(n). */
-    return n;
+
+    int cmp = key_compare(n, key);
+    if (cmp < 0) {
+        struct rb_node *new_left = insert_rec(n->left, key, value);
+        if (new_left == NULL) {
+            return NULL; /* allocation failure; n and every ancestor untouched */
+        }
+        n->left = new_left;
+    } else if (cmp > 0) {
+        struct rb_node *new_right = insert_rec(n->right, key, value);
+        if (new_right == NULL) {
+            return NULL; /* allocation failure; n and every ancestor untouched */
+        }
+        n->right = new_right;
+    } else {
+        /* TODO: key already exists. Header contract: "Overwriting an existing
+         * key frees the old value via value_free" -- blocked on struct
+         * rbtree/insert_rec not yet having access to that callback. See
+         * response for this change. */
+        return n;
+    }
+
+    return insert_fixup(n);
 }
 
 int rb_insert(struct rbtree *t, const char *key, void *value) {
