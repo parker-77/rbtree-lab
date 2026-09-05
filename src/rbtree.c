@@ -16,7 +16,20 @@ struct rb_node {
 
 struct rbtree {
     struct rb_node *root;
+    rb_value_free_fn value_free; /* may be NULL: values not owned */
 };
+
+/* Allocates an empty tree. Returns NULL on allocation failure. */
+rbtree_t *rb_create(rb_value_free_fn value_free) {
+    struct rbtree *t = malloc(sizeof *t);
+    if (t == NULL) {
+        return NULL;
+    }
+
+    t->root = NULL;
+    t->value_free = value_free;
+    return t;
+}
 
 /* Allocates a new red leaf node, copying key. Returns NULL on allocation
  * failure (nothing allocated survives such a failure). */
@@ -136,29 +149,33 @@ static struct rb_node *insert_fixup(struct rb_node *n) {
  * subtree is empty). Returns NULL on allocation failure, in which case n and
  * every ancestor above it must be left untouched by the caller. */
 static struct rb_node *insert_rec(struct rb_node *n, const char *key,
-                                   void *value) {
+                                   void *value, rb_value_free_fn value_free) {
     if (n == NULL) {
         return new_node(key, value);
     }
 
     int cmp = key_compare(n, key);
     if (cmp < 0) {
-        struct rb_node *new_left = insert_rec(n->left, key, value);
+        struct rb_node *new_left = insert_rec(n->left, key, value, value_free);
         if (new_left == NULL) {
             return NULL; /* allocation failure; n and every ancestor untouched */
         }
         n->left = new_left;
     } else if (cmp > 0) {
-        struct rb_node *new_right = insert_rec(n->right, key, value);
+        struct rb_node *new_right =
+            insert_rec(n->right, key, value, value_free);
         if (new_right == NULL) {
             return NULL; /* allocation failure; n and every ancestor untouched */
         }
         n->right = new_right;
     } else {
-        /* TODO: key already exists. Header contract: "Overwriting an existing
-         * key frees the old value via value_free" -- blocked on struct
-         * rbtree/insert_rec not yet having access to that callback. See
-         * response for this change. */
+        /* key already exists: free the old value (if the tree owns values),
+         * then the node takes ownership of the new one in its place. No
+         * allocation or structural change, so no fixup is needed. */
+        if (value_free != NULL) {
+            value_free(n->value);
+        }
+        n->value = value;
         return n;
     }
 
@@ -166,7 +183,7 @@ static struct rb_node *insert_rec(struct rb_node *n, const char *key,
 }
 
 int rb_insert(struct rbtree *t, const char *key, void *value) {
-    struct rb_node *new_root = insert_rec(t->root, key, value);
+    struct rb_node *new_root = insert_rec(t->root, key, value, t->value_free);
     if (new_root == NULL) {
         return -1; /* allocation failure; t unchanged */
     }

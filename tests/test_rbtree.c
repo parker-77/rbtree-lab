@@ -287,7 +287,7 @@ static void test_insert_rec_attaches_new_leaf(void) {
     struct rb_node r = {.key = "zulu", .left = NULL, .right = NULL, .color = BLACK};
     struct rb_node n = {.key = "mango", .left = NULL, .right = &r, .color = BLACK};
 
-    struct rb_node *new_root = insert_rec(&n, "apple", (void *)0xABCD);
+    struct rb_node *new_root = insert_rec(&n, "apple", (void *)0xABCD, NULL);
 
     CHECK(new_root == &n); /* no violation: n comes back untouched in shape */
     if (new_root != &n) {
@@ -318,7 +318,7 @@ static void test_insert_rec_two_level_ll_violation(void) {
     struct rb_node l = {.key = "g", .left = NULL, .right = NULL, .color = RED};
     struct rb_node n = {.key = "m", .left = &l, .right = NULL, .color = BLACK};
 
-    struct rb_node *new_root = insert_rec(&n, "c", (void *)0xC0FFEE);
+    struct rb_node *new_root = insert_rec(&n, "c", (void *)0xC0FFEE, NULL);
 
     CHECK(new_root == &l);
     if (new_root != &l) {
@@ -343,6 +343,67 @@ static void test_insert_rec_two_level_ll_violation(void) {
     free(newleaf);
 }
 
+/* --- rb_create / value_free ---------------------------------------------
+ * rb_destroy doesn't exist yet, so these tests free the tree (and, in the
+ * overwrite test, its one node) by hand instead of through the public API. */
+
+static void dummy_value_free(void *value) {
+    (void)value;
+}
+
+static void test_rb_create_sets_fields(void) {
+    rbtree_t *t = rb_create(NULL);
+    CHECK(t != NULL);
+    if (t == NULL) {
+        return;
+    }
+    CHECK(t->root == NULL);
+    CHECK(t->value_free == NULL);
+
+    free(t);
+}
+
+static void test_rb_create_stores_value_free(void) {
+    rbtree_t *t = rb_create(dummy_value_free);
+    CHECK(t != NULL);
+    if (t == NULL) {
+        return;
+    }
+    CHECK(t->value_free == dummy_value_free);
+
+    free(t);
+}
+
+static int free_call_count = 0;
+
+static void counting_value_free(void *value) {
+    (void)value;
+    free_call_count++;
+}
+
+static void test_rb_insert_overwrite_frees_old_value(void) {
+    rbtree_t *t = rb_create(counting_value_free);
+    CHECK(t != NULL);
+    if (t == NULL) {
+        return;
+    }
+    free_call_count = 0;
+
+    CHECK(rb_insert(t, "key", (void *)0x1) == 0);
+    CHECK(free_call_count == 0); /* first insert: nothing to overwrite */
+
+    CHECK(rb_insert(t, "key", (void *)0x2) == 0);
+    CHECK(free_call_count == 1); /* old value (0x1) freed exactly once */
+    CHECK(t->root != NULL);
+    if (t->root != NULL) {
+        CHECK(t->root->value == (void *)0x2);
+        CHECK(strcmp(t->root->key, "key") == 0);
+        free(t->root->key);
+        free(t->root);
+    }
+    free(t);
+}
+
 int main(void) {
     test_new_node_sets_fields();
     test_new_node_copies_key();
@@ -358,6 +419,9 @@ int main(void) {
     test_insert_fixup_noop_when_no_violation();
     test_insert_rec_attaches_new_leaf();
     test_insert_rec_two_level_ll_violation();
+    test_rb_create_sets_fields();
+    test_rb_create_stores_value_free();
+    test_rb_insert_overwrite_frees_old_value();
 
     if (failures == 0) {
         printf("all tests passed\n");

@@ -12,3 +12,22 @@ LEARNED: Parent pointers are more trouble than they're worth. Some CMake tools
 NEXT FIRST STEP: Implement rotations.
 OPEN: How does `value_free` function affect value ownership? How can it be NULL?
   Where is it implemented?
+
+## 2026-09-04
+STATE: All green
+DID: Implemented rotations, insert fixup, insert recursion, and create.
+DECIDED: No major decisions this time.
+LEARNED: C isn't as scary as I thought it was. 
+NEXT FIRST STEP: Set up Docker container to successfully run `make test`, `make asan`, 
+    and `make memcheck`.
+OPEN: What exactly does `typedef void (*rb_value_free_fn)(void *value)` mean?
+    Is `value_free` a function or essentially a bool for whether the tree owns
+    values or not? Review project spec about deletion cases that must be covered.
+
+## Template
+STATE: 
+DID: 
+DECIDED: 
+LEARNED: 
+NEXT FIRST STEP: 
+OPEN: 
