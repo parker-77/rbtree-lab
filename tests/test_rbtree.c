@@ -287,8 +287,11 @@ static void test_insert_rec_attaches_new_leaf(void) {
     struct rb_node r = {.key = "zulu", .left = NULL, .right = NULL, .color = BLACK};
     struct rb_node n = {.key = "mango", .left = NULL, .right = &r, .color = BLACK};
 
-    struct rb_node *new_root = insert_rec(&n, "apple", (void *)0xABCD, NULL);
+    bool inserted = false;
+    struct rb_node *new_root =
+        insert_rec(&n, "apple", (void *)0xABCD, NULL, &inserted);
 
+    CHECK(inserted);
     CHECK(new_root == &n); /* no violation: n comes back untouched in shape */
     if (new_root != &n) {
         return;
@@ -318,8 +321,11 @@ static void test_insert_rec_two_level_ll_violation(void) {
     struct rb_node l = {.key = "g", .left = NULL, .right = NULL, .color = RED};
     struct rb_node n = {.key = "m", .left = &l, .right = NULL, .color = BLACK};
 
-    struct rb_node *new_root = insert_rec(&n, "c", (void *)0xC0FFEE, NULL);
+    bool inserted = false;
+    struct rb_node *new_root =
+        insert_rec(&n, "c", (void *)0xC0FFEE, NULL, &inserted);
 
+    CHECK(inserted);
     CHECK(new_root == &l);
     if (new_root != &l) {
         return;
@@ -359,6 +365,7 @@ static void test_rb_create_sets_fields(void) {
     }
     CHECK(t->root == NULL);
     CHECK(t->value_free == NULL);
+    CHECK(t->size == 0);
 
     free(t);
 }
@@ -394,6 +401,7 @@ static void test_rb_insert_overwrite_frees_old_value(void) {
 
     CHECK(rb_insert(t, "key", (void *)0x2) == 0);
     CHECK(free_call_count == 1); /* old value (0x1) freed exactly once */
+    CHECK(rb_size(t) == 1);      /* overwrite must not change size */
     CHECK(t->root != NULL);
     if (t->root != NULL) {
         CHECK(t->root->value == (void *)0x2);
@@ -401,6 +409,45 @@ static void test_rb_insert_overwrite_frees_old_value(void) {
         free(t->root->key);
         free(t->root);
     }
+    free(t);
+}
+
+/* --- rb_size -------------------------------------------------------------
+ * rb_destroy doesn't exist yet, so this test frees the tree's nodes by hand
+ * via a small recursive walk (test-local; not part of the public API). */
+
+static void free_node_manual(struct rb_node *n) {
+    if (n == NULL) {
+        return;
+    }
+    free_node_manual(n->left);
+    free_node_manual(n->right);
+    free(n->key);
+    free(n);
+}
+
+static void test_rb_size_tracks_distinct_keys(void) {
+    rbtree_t *t = rb_create(NULL);
+    CHECK(t != NULL);
+    if (t == NULL) {
+        return;
+    }
+
+    CHECK(rb_size(t) == 0);
+
+    CHECK(rb_insert(t, "b", NULL) == 0);
+    CHECK(rb_size(t) == 1);
+
+    CHECK(rb_insert(t, "a", NULL) == 0);
+    CHECK(rb_size(t) == 2);
+
+    CHECK(rb_insert(t, "c", NULL) == 0);
+    CHECK(rb_size(t) == 3);
+
+    CHECK(rb_insert(t, "b", NULL) == 0); /* overwrite: size unchanged */
+    CHECK(rb_size(t) == 3);
+
+    free_node_manual(t->root);
     free(t);
 }
 
@@ -422,6 +469,7 @@ int main(void) {
     test_rb_create_sets_fields();
     test_rb_create_stores_value_free();
     test_rb_insert_overwrite_frees_old_value();
+    test_rb_size_tracks_distinct_keys();
 
     if (failures == 0) {
         printf("all tests passed\n");

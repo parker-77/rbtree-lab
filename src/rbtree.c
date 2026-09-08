@@ -17,6 +17,7 @@ struct rb_node {
 struct rbtree {
     struct rb_node *root;
     rb_value_free_fn value_free; /* may be NULL: values not owned */
+    size_t size;                 /* count of distinct keys */
 };
 
 /* Allocates an empty tree. Returns NULL on allocation failure. */
@@ -28,6 +29,7 @@ rbtree_t *rb_create(rb_value_free_fn value_free) {
 
     t->root = NULL;
     t->value_free = value_free;
+    t->size = 0;
     return t;
 }
 
@@ -147,23 +149,32 @@ static struct rb_node *insert_fixup(struct rb_node *n) {
 
 /* Recursive insert helper. n is the current subtree root (NULL if the
  * subtree is empty). Returns NULL on allocation failure, in which case n and
- * every ancestor above it must be left untouched by the caller. */
+ * every ancestor above it must be left untouched by the caller. On success,
+ * sets *inserted to true iff a brand-new node was allocated (as opposed to an
+ * existing key's value being overwritten), so the caller can maintain a size
+ * count without re-walking the tree. */
 static struct rb_node *insert_rec(struct rb_node *n, const char *key,
-                                   void *value, rb_value_free_fn value_free) {
+                                   void *value, rb_value_free_fn value_free,
+                                   bool *inserted) {
     if (n == NULL) {
-        return new_node(key, value);
+        struct rb_node *new_n = new_node(key, value);
+        if (new_n != NULL) {
+            *inserted = true;
+        }
+        return new_n;
     }
 
     int cmp = key_compare(n, key);
     if (cmp < 0) {
-        struct rb_node *new_left = insert_rec(n->left, key, value, value_free);
+        struct rb_node *new_left =
+            insert_rec(n->left, key, value, value_free, inserted);
         if (new_left == NULL) {
             return NULL; /* allocation failure; n and every ancestor untouched */
         }
         n->left = new_left;
     } else if (cmp > 0) {
         struct rb_node *new_right =
-            insert_rec(n->right, key, value, value_free);
+            insert_rec(n->right, key, value, value_free, inserted);
         if (new_right == NULL) {
             return NULL; /* allocation failure; n and every ancestor untouched */
         }
@@ -183,11 +194,20 @@ static struct rb_node *insert_rec(struct rb_node *n, const char *key,
 }
 
 int rb_insert(struct rbtree *t, const char *key, void *value) {
-    struct rb_node *new_root = insert_rec(t->root, key, value, t->value_free);
+    bool inserted = false;
+    struct rb_node *new_root =
+        insert_rec(t->root, key, value, t->value_free, &inserted);
     if (new_root == NULL) {
         return -1; /* allocation failure; t unchanged */
     }
     t->root = new_root;
     t->root->color = BLACK;
-    return 0; /* TODO: size bookkeeping once struct rbtree gets a size field */
+    if (inserted) {
+        t->size++;
+    }
+    return 0;
+}
+
+size_t rb_size(const rbtree_t *t) {
+    return t->size;
 }
