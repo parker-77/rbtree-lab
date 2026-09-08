@@ -211,3 +211,35 @@ int rb_insert(struct rbtree *t, const char *key, void *value) {
 size_t rb_size(const rbtree_t *t) {
     return t->size;
 }
+
+void *rb_find(const rbtree_t *t, const char *key) {
+    const struct rb_node *n = t->root;
+    /* invariant: key, if present, is somewhere in the subtree rooted at n */
+    while (n != NULL) {
+        int cmp = key_compare(n, key);
+        if (cmp == 0) {
+            return n->value;
+        }
+        n = cmp < 0 ? n->left : n->right;
+    }
+    return NULL;
+}
+
+/* In-order recursion: left subtree, then n itself, then right subtree —
+ * visits keys in ascending strcmp order. */
+static void foreach_rec(const struct rb_node *n,
+                         void (*fn)(const char *key, void *value, void *ctx),
+                         void *ctx) {
+    if (n == NULL) {
+        return;
+    }
+    foreach_rec(n->left, fn, ctx);
+    fn(n->key, n->value, ctx);
+    foreach_rec(n->right, fn, ctx);
+}
+
+void rb_foreach(const rbtree_t *t,
+                void (*fn)(const char *key, void *value, void *ctx),
+                void *ctx) {
+    foreach_rec(t->root, fn, ctx);
+}

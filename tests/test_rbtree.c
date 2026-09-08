@@ -451,6 +451,111 @@ static void test_rb_size_tracks_distinct_keys(void) {
     free(t);
 }
 
+/* --- rb_find --------------------------------------------------------- */
+
+static void test_rb_find_returns_value_for_present_key(void) {
+    rbtree_t *t = rb_create(NULL);
+    CHECK(t != NULL);
+    if (t == NULL) {
+        return;
+    }
+
+    CHECK(rb_insert(t, "b", (void *)0xB) == 0);
+    CHECK(rb_insert(t, "a", (void *)0xA) == 0);
+    CHECK(rb_insert(t, "c", (void *)0xC) == 0);
+
+    CHECK(rb_find(t, "a") == (void *)0xA);
+    CHECK(rb_find(t, "b") == (void *)0xB);
+    CHECK(rb_find(t, "c") == (void *)0xC);
+
+    free_node_manual(t->root);
+    free(t);
+}
+
+static void test_rb_find_returns_null_for_absent_key(void) {
+    rbtree_t *t = rb_create(NULL);
+    CHECK(t != NULL);
+    if (t == NULL) {
+        return;
+    }
+
+    CHECK(rb_insert(t, "b", (void *)0xB) == 0);
+
+    CHECK(rb_find(t, "z") == NULL);
+
+    free_node_manual(t->root);
+    free(t);
+}
+
+static void test_rb_find_on_empty_tree_returns_null(void) {
+    rbtree_t *t = rb_create(NULL);
+    CHECK(t != NULL);
+    if (t == NULL) {
+        return;
+    }
+
+    CHECK(rb_find(t, "anything") == NULL);
+
+    free(t);
+}
+
+/* --- rb_foreach --------------------------------------------------------- */
+
+struct collect_ctx {
+    const char *keys[8];
+    size_t count;
+};
+
+static void collect_key(const char *key, void *value, void *ctx) {
+    (void)value;
+    struct collect_ctx *c = ctx;
+    c->keys[c->count++] = key;
+}
+
+static void test_rb_foreach_visits_in_order(void) {
+    rbtree_t *t = rb_create(NULL);
+    CHECK(t != NULL);
+    if (t == NULL) {
+        return;
+    }
+
+    CHECK(rb_insert(t, "d", NULL) == 0);
+    CHECK(rb_insert(t, "b", NULL) == 0);
+    CHECK(rb_insert(t, "f", NULL) == 0);
+    CHECK(rb_insert(t, "a", NULL) == 0);
+    CHECK(rb_insert(t, "c", NULL) == 0);
+    CHECK(rb_insert(t, "e", NULL) == 0);
+
+    struct collect_ctx c = {.count = 0};
+    rb_foreach(t, collect_key, &c);
+
+    CHECK(c.count == 6);
+    if (c.count == 6) {
+        const char *expected[] = {"a", "b", "c", "d", "e", "f"};
+        for (size_t i = 0; i < 6; i++) {
+            CHECK(strcmp(c.keys[i], expected[i]) == 0);
+        }
+    }
+
+    free_node_manual(t->root);
+    free(t);
+}
+
+static void test_rb_foreach_on_empty_tree_does_nothing(void) {
+    rbtree_t *t = rb_create(NULL);
+    CHECK(t != NULL);
+    if (t == NULL) {
+        return;
+    }
+
+    struct collect_ctx c = {.count = 0};
+    rb_foreach(t, collect_key, &c);
+
+    CHECK(c.count == 0);
+
+    free(t);
+}
+
 int main(void) {
     test_new_node_sets_fields();
     test_new_node_copies_key();
@@ -470,6 +575,11 @@ int main(void) {
     test_rb_create_stores_value_free();
     test_rb_insert_overwrite_frees_old_value();
     test_rb_size_tracks_distinct_keys();
+    test_rb_find_returns_value_for_present_key();
+    test_rb_find_returns_null_for_absent_key();
+    test_rb_find_on_empty_tree_returns_null();
+    test_rb_foreach_visits_in_order();
+    test_rb_foreach_on_empty_tree_does_nothing();
 
     if (failures == 0) {
         printf("all tests passed\n");
