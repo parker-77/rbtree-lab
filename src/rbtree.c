@@ -20,6 +20,23 @@ struct rbtree {
     size_t size;                 /* count of distinct keys */
 };
 
+/* Internal helpers; defined below the public API they support. */
+static struct rb_node *new_node(const char *key, void *value);
+static int key_compare(const struct rb_node *n, const char *key);
+static bool is_red(const struct rb_node *n);
+static struct rb_node *rotate_left(struct rb_node *n);
+static struct rb_node *rotate_right(struct rb_node *n);
+static struct rb_node *insert_fixup(struct rb_node *n);
+static struct rb_node *insert_rec(struct rb_node *n, const char *key,
+                                   void *value, rb_value_free_fn value_free,
+                                   bool *inserted);
+static void foreach_rec(const struct rb_node *n,
+                         void (*fn)(const char *key, void *value, void *ctx),
+                         void *ctx);
+static void destroy_rec(struct rb_node *n, rb_value_free_fn value_free);
+static int validate_rec(const struct rb_node *n, const char **prev_key,
+                         size_t *count, int *error);
+
 /* Allocates an empty tree. Returns NULL on allocation failure. */
 rbtree_t *rb_create(rb_value_free_fn value_free) {
     struct rbtree *t = malloc(sizeof *t);
@@ -31,6 +48,69 @@ rbtree_t *rb_create(rb_value_free_fn value_free) {
     t->value_free = value_free;
     t->size = 0;
     return t;
+}
+
+int rb_insert(struct rbtree *t, const char *key, void *value) {
+    bool inserted = false;
+    struct rb_node *new_root =
+        insert_rec(t->root, key, value, t->value_free, &inserted);
+    if (new_root == NULL) {
+        return -1; /* allocation failure; t unchanged */
+    }
+    t->root = new_root;
+    t->root->color = BLACK;
+    if (inserted) {
+        t->size++;
+    }
+    return 0;
+}
+
+void *rb_find(const rbtree_t *t, const char *key) {
+    const struct rb_node *n = t->root;
+    /* invariant: key, if present, is somewhere in the subtree rooted at n */
+    while (n != NULL) {
+        int cmp = key_compare(n, key);
+        if (cmp == 0) {
+            return n->value;
+        }
+        n = cmp < 0 ? n->left : n->right;
+    }
+    return NULL;
+}
+
+size_t rb_size(const rbtree_t *t) {
+    return t->size;
+}
+
+void rb_foreach(const rbtree_t *t,
+                void (*fn)(const char *key, void *value, void *ctx),
+                void *ctx) {
+    foreach_rec(t->root, fn, ctx);
+}
+
+int rb_validate(const rbtree_t *t) {
+    if (is_red(t->root)) {
+        return 1; /* root not black */
+    }
+
+    const char *prev_key = NULL;
+    size_t count = 0;
+    int error = 0;
+    if (validate_rec(t->root, &prev_key, &count, &error) < 0) {
+        return error;
+    }
+    if (count != t->size) {
+        return 5; /* rb_size doesn't match actual node count */
+    }
+    return 0;
+}
+
+void rb_destroy(rbtree_t *t) {
+    if (t == NULL) {
+        return;
+    }
+    destroy_rec(t->root, t->value_free);
+    free(t);
 }
 
 /* Allocates a new red leaf node, copying key. Returns NULL on allocation
@@ -193,38 +273,6 @@ static struct rb_node *insert_rec(struct rb_node *n, const char *key,
     return insert_fixup(n);
 }
 
-int rb_insert(struct rbtree *t, const char *key, void *value) {
-    bool inserted = false;
-    struct rb_node *new_root =
-        insert_rec(t->root, key, value, t->value_free, &inserted);
-    if (new_root == NULL) {
-        return -1; /* allocation failure; t unchanged */
-    }
-    t->root = new_root;
-    t->root->color = BLACK;
-    if (inserted) {
-        t->size++;
-    }
-    return 0;
-}
-
-size_t rb_size(const rbtree_t *t) {
-    return t->size;
-}
-
-void *rb_find(const rbtree_t *t, const char *key) {
-    const struct rb_node *n = t->root;
-    /* invariant: key, if present, is somewhere in the subtree rooted at n */
-    while (n != NULL) {
-        int cmp = key_compare(n, key);
-        if (cmp == 0) {
-            return n->value;
-        }
-        n = cmp < 0 ? n->left : n->right;
-    }
-    return NULL;
-}
-
 /* In-order recursion: left subtree, then n itself, then right subtree —
  * visits keys in ascending strcmp order. */
 static void foreach_rec(const struct rb_node *n,
@@ -236,12 +284,6 @@ static void foreach_rec(const struct rb_node *n,
     foreach_rec(n->left, fn, ctx);
     fn(n->key, n->value, ctx);
     foreach_rec(n->right, fn, ctx);
-}
-
-void rb_foreach(const rbtree_t *t,
-                void (*fn)(const char *key, void *value, void *ctx),
-                void *ctx) {
-    foreach_rec(t->root, fn, ctx);
 }
 
 /* Post-order recursion: left subtree, right subtree, then n itself. Must be
@@ -262,10 +304,48 @@ static void destroy_rec(struct rb_node *n, rb_value_free_fn value_free) {
     free(n); /* tree relinquishes ownership of the node itself */
 }
 
-void rb_destroy(rbtree_t *t) {
-    if (t == NULL) {
-        return;
+/* Returns this subtree's black-height (>= 0), or -1 if a violation was found
+ * anywhere in it, in which case *error holds the failing rule's code
+ * (2 = red node has a red child, 3 = unequal black-height across paths,
+ * 4 = keys not strictly increasing in-order) and the caller must propagate
+ * -1 immediately without trusting *count or *prev_key further.
+ *
+ * *prev_key threads the most recently in-order-visited key across the whole
+ * traversal (shared storage, not a per-call copy) so this node can be
+ * compared against whichever node was visited immediately before it,
+ * however far apart in the recursion that was. *count threads a running
+ * node count the same way. */
+static int validate_rec(const struct rb_node *n, const char **prev_key,
+                         size_t *count, int *error) {
+    if (n == NULL) {
+        return 0;
     }
-    destroy_rec(t->root, t->value_free);
-    free(t);
+
+    if (is_red(n) && (is_red(n->left) || is_red(n->right))) {
+        *error = 2; /* red node has a red child */
+        return -1;
+    }
+
+    int left_bh = validate_rec(n->left, prev_key, count, error);
+    if (left_bh < 0) {
+        return -1;
+    }
+
+    if (*prev_key != NULL && strcmp(*prev_key, n->key) >= 0) {
+        *error = 4; /* keys not strictly increasing in-order */
+        return -1;
+    }
+    *prev_key = n->key;
+    (*count)++;
+
+    int right_bh = validate_rec(n->right, prev_key, count, error);
+    if (right_bh < 0) {
+        return -1;
+    }
+
+    if (left_bh != right_bh) {
+        *error = 3; /* unequal black-height across paths */
+        return -1;
+    }
+    return left_bh + (n->color == BLACK ? 1 : 0);
 }

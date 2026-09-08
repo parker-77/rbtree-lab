@@ -582,6 +582,82 @@ static void test_rb_destroy_null_is_noop(void) {
     rb_destroy(NULL); /* must not crash */
 }
 
+/* --- rb_validate -----------------------------------------------------
+ * Most of these hand-build a struct rbtree directly (rather than going
+ * through rb_create/rb_insert) so each test can isolate exactly one rule
+ * violation without the others interfering. */
+
+static void test_rb_validate_valid_tree_is_zero(void) {
+    rbtree_t *t = rb_create(NULL);
+    CHECK(t != NULL);
+    if (t == NULL) {
+        return;
+    }
+
+    CHECK(rb_insert(t, "d", NULL) == 0);
+    CHECK(rb_insert(t, "b", NULL) == 0);
+    CHECK(rb_insert(t, "f", NULL) == 0);
+    CHECK(rb_insert(t, "a", NULL) == 0);
+    CHECK(rb_insert(t, "c", NULL) == 0);
+    CHECK(rb_insert(t, "e", NULL) == 0);
+    CHECK(rb_insert(t, "g", NULL) == 0);
+
+    CHECK(rb_validate(t) == 0);
+
+    rb_destroy(t);
+}
+
+static void test_rb_validate_empty_tree_is_zero(void) {
+    rbtree_t *t = rb_create(NULL);
+    CHECK(t != NULL);
+    if (t == NULL) {
+        return;
+    }
+
+    CHECK(rb_validate(t) == 0);
+
+    rb_destroy(t);
+}
+
+static void test_rb_validate_detects_red_root(void) {
+    struct rb_node root = {.key = "a", .color = RED};
+    struct rbtree t = {.root = &root, .value_free = NULL, .size = 1};
+
+    CHECK(rb_validate(&t) == 1);
+}
+
+static void test_rb_validate_detects_red_red(void) {
+    struct rb_node gc = {.key = "z", .color = RED};
+    struct rb_node child = {.key = "a", .left = &gc, .color = RED};
+    struct rb_node root = {.key = "b", .left = &child, .color = BLACK};
+    struct rbtree t = {.root = &root, .value_free = NULL, .size = 3};
+
+    CHECK(rb_validate(&t) == 2);
+}
+
+static void test_rb_validate_detects_black_height_mismatch(void) {
+    struct rb_node l = {.key = "b", .color = BLACK};
+    struct rb_node root = {.key = "m", .left = &l, .color = BLACK};
+    struct rbtree t = {.root = &root, .value_free = NULL, .size = 2};
+
+    CHECK(rb_validate(&t) == 3);
+}
+
+static void test_rb_validate_detects_order_violation(void) {
+    struct rb_node l = {.key = "z", .color = BLACK}; /* not < root's key */
+    struct rb_node root = {.key = "a", .left = &l, .color = BLACK};
+    struct rbtree t = {.root = &root, .value_free = NULL, .size = 2};
+
+    CHECK(rb_validate(&t) == 4);
+}
+
+static void test_rb_validate_detects_size_mismatch(void) {
+    struct rb_node root = {.key = "a", .color = BLACK};
+    struct rbtree t = {.root = &root, .value_free = NULL, .size = 2};
+
+    CHECK(rb_validate(&t) == 5);
+}
+
 int main(void) {
     test_new_node_sets_fields();
     test_new_node_copies_key();
@@ -608,6 +684,13 @@ int main(void) {
     test_rb_foreach_on_empty_tree_does_nothing();
     test_rb_destroy_frees_all_values();
     test_rb_destroy_null_is_noop();
+    test_rb_validate_valid_tree_is_zero();
+    test_rb_validate_empty_tree_is_zero();
+    test_rb_validate_detects_red_root();
+    test_rb_validate_detects_red_red();
+    test_rb_validate_detects_black_height_mismatch();
+    test_rb_validate_detects_order_violation();
+    test_rb_validate_detects_size_mismatch();
 
     if (failures == 0) {
         printf("all tests passed\n");
