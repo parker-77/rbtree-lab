@@ -243,3 +243,29 @@ void rb_foreach(const rbtree_t *t,
                 void *ctx) {
     foreach_rec(t->root, fn, ctx);
 }
+
+/* Post-order recursion: left subtree, right subtree, then n itself. Must be
+ * post-order (not in-order, like foreach_rec) because n is freed at the end
+ * of this frame — both children have to already be fully recursed into
+ * (their pointers read) before that happens, or the second recursive call
+ * would read n->right off an already-freed n. */
+static void destroy_rec(struct rb_node *n, rb_value_free_fn value_free) {
+    if (n == NULL) {
+        return;
+    }
+    destroy_rec(n->left, value_free);
+    destroy_rec(n->right, value_free);
+    if (value_free != NULL) {
+        value_free(n->value); /* tree relinquishes ownership of value */
+    }
+    free(n->key);
+    free(n); /* tree relinquishes ownership of the node itself */
+}
+
+void rb_destroy(rbtree_t *t) {
+    if (t == NULL) {
+        return;
+    }
+    destroy_rec(t->root, t->value_free);
+    free(t);
+}

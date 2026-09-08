@@ -556,6 +556,32 @@ static void test_rb_foreach_on_empty_tree_does_nothing(void) {
     free(t);
 }
 
+/* --- rb_destroy ----------------------------------------------------------
+ * Unlike the tests above, these exercise the real public API end to end:
+ * rb_destroy owns freeing every key, value, and node itself, so nothing is
+ * freed by hand here. */
+
+static void test_rb_destroy_frees_all_values(void) {
+    rbtree_t *t = rb_create(counting_value_free);
+    CHECK(t != NULL);
+    if (t == NULL) {
+        return;
+    }
+
+    CHECK(rb_insert(t, "b", (void *)0x1) == 0);
+    CHECK(rb_insert(t, "a", (void *)0x2) == 0);
+    CHECK(rb_insert(t, "c", (void *)0x3) == 0);
+    CHECK(rb_insert(t, "d", (void *)0x4) == 0);
+
+    free_call_count = 0;
+    rb_destroy(t);
+    CHECK(free_call_count == 4); /* every distinct value freed exactly once */
+}
+
+static void test_rb_destroy_null_is_noop(void) {
+    rb_destroy(NULL); /* must not crash */
+}
+
 int main(void) {
     test_new_node_sets_fields();
     test_new_node_copies_key();
@@ -580,6 +606,8 @@ int main(void) {
     test_rb_find_on_empty_tree_returns_null();
     test_rb_foreach_visits_in_order();
     test_rb_foreach_on_empty_tree_does_nothing();
+    test_rb_destroy_frees_all_values();
+    test_rb_destroy_null_is_noop();
 
     if (failures == 0) {
         printf("all tests passed\n");
