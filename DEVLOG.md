@@ -28,6 +28,8 @@ OPEN: What exactly does `typedef void (*rb_value_free_fn)(void *value)` mean?
 
 ## 2026-09-08
 
+### Session 1
+
 STATE: All green
 DID: Finish M1 implementation. Skipped Docker for now.
 DECIDED: Recursion for all traversals. No internal use of `rb_foreach` because
@@ -39,3 +41,14 @@ NEXT FIRST STEP: Set up Docker container to successfully run `make test`, `make 
     and `make memcheck`.
 OPEN: How to get valgrind and memory leak check in asan working. Docker may work,
     but unsure.
+
+### Session 2
+
+STATE: All green
+DID: Docker set up complete. Now run tests and checks with `make docker-*` commands
+DECIDED: Use Docker to resolve Apple Silicon arch issues.
+LEARNED: Tools like `asan` and `valgrind` do work with arm64 architecture, just not
+    with Apple Silicon. A container running a linux/arm64 image will resolve these
+    issues.
+NEXT FIRST STEP: Begin M2.
+OPEN: Exact requirements for fuzzer.

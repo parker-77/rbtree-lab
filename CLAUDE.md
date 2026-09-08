@@ -15,7 +15,7 @@ variables were allocated/freed and which allocations survive the change
 
 ## Commands
 - Build & unit tests: ‘make test‘
-- Sanitizers: ‘make asan‘ Valgrind: ‘make memcheck‘
+- Sanitizers: ‘make docker-asan‘ Valgrind: ‘make docker-memcheck‘
 - A change is DONE only when all three pass. Always run them; show output.
 
 ## Hard constraints
