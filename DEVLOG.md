@@ -52,3 +52,13 @@ LEARNED: Tools like `asan` and `valgrind` do work with arm64 architecture, just 
     issues.
 NEXT FIRST STEP: Begin M2.
 OPEN: Exact requirements for fuzzer.
+
+## 2026-09-09
+
+STATE: All green
+DID: Implemented `rb_delete`. Added docstrings to tests for quick reference
+DECIDED: Stuck with spec's description of "hoisting" key and data to doomed node rather
+    than splicing successor.
+LEARNED: Multiple deletion cases can be reduced into simpler ones.
+NEXT FIRST STEP: Implement fuzzer.
+OPEN: Exact requirements for fuzzer. Review deletion cases for personal understanding.

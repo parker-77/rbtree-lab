@@ -1,5 +1,6 @@
 #include "rbtree.h"
 
+#include <assert.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +31,13 @@ static struct rb_node *insert_fixup(struct rb_node *n);
 static struct rb_node *insert_rec(struct rb_node *n, const char *key,
                                    void *value, rb_value_free_fn value_free,
                                    bool *inserted);
+static struct rb_node *fixup_left_deficit(struct rb_node *n, bool *shorter);
+static struct rb_node *fixup_right_deficit(struct rb_node *n, bool *shorter);
+static struct rb_node *extract_min(struct rb_node *n, char **out_key,
+                                    void **out_value, bool *shorter);
+static struct rb_node *delete_rec(struct rb_node *n, const char *key,
+                                   rb_value_free_fn value_free, bool *deleted,
+                                   bool *shorter);
 static void foreach_rec(const struct rb_node *n,
                          void (*fn)(const char *key, void *value, void *ctx),
                          void *ctx);
@@ -76,6 +84,27 @@ void *rb_find(const rbtree_t *t, const char *key) {
         n = cmp < 0 ? n->left : n->right;
     }
     return NULL;
+}
+
+/* Removes key; frees the key copy and the value (via value_free, only if the
+ * tree owns values). Returns -1 if key is absent, leaving t untouched
+ * (delete_rec performs no allocation, so every intermediate reassignment on
+ * the absent-key path re-writes a child pointer to its own existing value). */
+int rb_delete(rbtree_t *t, const char *key) {
+    bool deleted = false;
+    bool shorter = false;
+    struct rb_node *new_root =
+        delete_rec(t->root, key, t->value_free, &deleted, &shorter);
+    if (!deleted) {
+        return -1; /* key absent; t left untouched */
+    }
+
+    t->root = new_root;
+    if (t->root != NULL) {
+        t->root->color = BLACK;
+    }
+    t->size--;
+    return 0;
 }
 
 size_t rb_size(const rbtree_t *t) {
@@ -271,6 +300,251 @@ static struct rb_node *insert_rec(struct rb_node *n, const char *key,
     }
 
     return insert_fixup(n);
+}
+
+/* Rebalances n after n->right's black-height dropped by one (the deficient
+ * subtree was already reattached to n->right by the caller).
+ *
+ * Case A (red sibling): rotate the sibling up and demote n (now red) under
+ * it, then resolve n's same deficiency again against its new sibling — one
+ * of s's own children, which must be black (a red node's children always
+ * are), so the recursive call below is guaranteed to land in case B, C, or
+ * D and never re-enter case A. The overall new subtree root is always the
+ * promoted (old) sibling; only what the recursive call returns for n's own
+ * slot underneath it is still undetermined at that point.
+ *
+ * Case B (black sibling, both nephews black): recolor the sibling red; n
+ * either absorbs the deficit (if red) or passes it up (if black).
+ *
+ * Case C (black sibling, red far nephew — near nephew's color is
+ * irrelevant, see DEVLOG/discussion): one rotation at n. The far nephew's
+ * recolor supplies the missing black; near nephew's own black-height was
+ * already equal to far's before the deletion, by the ordinary red-black
+ * invariant that a node's two children share one black-height, so it slots
+ * in under the now-black n without needing to change at all.
+ *
+ * Case D (black sibling, red near nephew, black far nephew): one rotation
+ * at the sibling turns this into case C's shape (the old sibling becomes
+ * the new "far nephew"), then case C's rotation applies at n. */
+static struct rb_node *fixup_right_deficit(struct rb_node *n, bool *shorter) {
+    struct rb_node *s = n->left; /* sibling: non-NULL, since it must have had
+                                     greater black-height than the deficient
+                                     side even before the deficit */
+    assert(s != NULL);
+
+    if (is_red(s)) {
+        rb_color_t n_color = n->color;
+        struct rb_node *promoted = rotate_right(n);
+        promoted->color = n_color;
+        n->color = RED;
+        promoted->right = fixup_right_deficit(n, shorter);
+        return promoted;
+    }
+
+    if (!is_red(s->left) && !is_red(s->right)) {
+        s->color = RED;
+        if (is_red(n)) {
+            n->color = BLACK; /* n absorbs the missing black locally */
+            *shorter = false;
+        } else {
+            *shorter = true; /* n has no black to spare; caller must fix up */
+        }
+        return n;
+    }
+
+    if (is_red(s->left)) {
+        struct rb_node *far = s->left;
+        rb_color_t n_color = n->color;
+        struct rb_node *new_root = rotate_right(n);
+        new_root->color = n_color;
+        n->color = BLACK;
+        far->color = BLACK;
+        *shorter = false;
+        return new_root;
+    }
+
+    struct rb_node *near = s->right;
+    s->color = RED;
+    near->color = BLACK;
+    n->left = rotate_left(s);
+
+    rb_color_t n_color = n->color;
+    struct rb_node *new_root = rotate_right(n);
+    new_root->color = n_color;
+    n->color = BLACK;
+    s->color = BLACK; /* s now plays the far-nephew role; absorb here too */
+    *shorter = false;
+    return new_root;
+}
+
+/* Mirror of fixup_right_deficit for a deficient left subtree (n->left just
+ * lost a black; sibling is n->right). */
+static struct rb_node *fixup_left_deficit(struct rb_node *n, bool *shorter) {
+    struct rb_node *s = n->right;
+    assert(s != NULL);
+
+    if (is_red(s)) {
+        rb_color_t n_color = n->color;
+        struct rb_node *promoted = rotate_left(n);
+        promoted->color = n_color;
+        n->color = RED;
+        promoted->left = fixup_left_deficit(n, shorter);
+        return promoted;
+    }
+
+    if (!is_red(s->left) && !is_red(s->right)) {
+        s->color = RED;
+        if (is_red(n)) {
+            n->color = BLACK;
+            *shorter = false;
+        } else {
+            *shorter = true;
+        }
+        return n;
+    }
+
+    if (is_red(s->right)) {
+        struct rb_node *far = s->right;
+        rb_color_t n_color = n->color;
+        struct rb_node *new_root = rotate_left(n);
+        new_root->color = n_color;
+        n->color = BLACK;
+        far->color = BLACK;
+        *shorter = false;
+        return new_root;
+    }
+
+    struct rb_node *near = s->left;
+    s->color = RED;
+    near->color = BLACK;
+    n->right = rotate_right(s);
+
+    rb_color_t n_color = n->color;
+    struct rb_node *new_root = rotate_left(n);
+    new_root->color = n_color;
+    n->color = BLACK;
+    s->color = BLACK;
+    *shorter = false;
+    return new_root;
+}
+
+/* Removes and returns ownership of the minimum-keyed node in the subtree
+ * rooted at n (n is never NULL: only called on a subtree already known to be
+ * non-empty). out_key and out_value receive the removed node's key and value
+ * pointers without freeing them — ownership transfers to the caller, which
+ * is responsible for freeing or reinstalling them. *shorter reports whether
+ * this subtree's black-height dropped by one. */
+static struct rb_node *extract_min(struct rb_node *n, char **out_key,
+                                    void **out_value, bool *shorter) {
+    if (n->left == NULL) {
+        *out_key = n->key;     /* ownership transferred to caller */
+        *out_value = n->value; /* ownership transferred to caller */
+        struct rb_node *right = n->right;
+        bool was_black = (n->color == BLACK);
+        free(n); /* node struct freed; key/value ownership already moved out */
+
+        if (right != NULL) {
+            right->color = BLACK; /* case 6: red child absorbs the black n had */
+            *shorter = false;
+        } else {
+            *shorter = was_black; /* removing a black leaf shortens this side */
+        }
+        return right;
+    }
+
+    struct rb_node *new_left = extract_min(n->left, out_key, out_value, shorter);
+    n->left = new_left;
+    if (*shorter) {
+        n = fixup_left_deficit(n, shorter);
+    }
+    return n;
+}
+
+/* Recursive delete helper, structured like insert_rec: n is the current
+ * subtree root (NULL if absent), and the return value is the new subtree
+ * root for the caller to reattach. *deleted reports whether key was found
+ * anywhere in this subtree (mirrors insert_rec's *inserted); *shorter
+ * reports whether the returned subtree's black-height is one less than what
+ * occupied this slot before the call. */
+static struct rb_node *delete_rec(struct rb_node *n, const char *key,
+                                   rb_value_free_fn value_free, bool *deleted,
+                                   bool *shorter) {
+    if (n == NULL) {
+        *shorter = false; /* key absent in this subtree; nothing to change */
+        return NULL;
+    }
+
+    int cmp = key_compare(n, key);
+    if (cmp < 0) {
+        struct rb_node *new_left =
+            delete_rec(n->left, key, value_free, deleted, shorter);
+        n->left = new_left;
+        if (*shorter) {
+            n = fixup_left_deficit(n, shorter);
+        }
+        return n;
+    }
+    if (cmp > 0) {
+        struct rb_node *new_right =
+            delete_rec(n->right, key, value_free, deleted, shorter);
+        n->right = new_right;
+        if (*shorter) {
+            n = fixup_right_deficit(n, shorter);
+        }
+        return n;
+    }
+
+    /* cmp == 0: n is the node to remove. */
+    *deleted = true;
+
+    if (n->left != NULL && n->right != NULL) {
+        /* Two children: move the in-order successor's key/value into n's
+         * slot, then remove the successor (which has at most one child) from
+         * n->right instead of removing n itself. n keeps its position, its
+         * color, and n->left untouched. */
+        char *succ_key;
+        void *succ_value;
+        bool succ_shorter = false;
+        struct rb_node *new_right =
+            extract_min(n->right, &succ_key, &succ_value, &succ_shorter);
+
+        if (value_free != NULL) {
+            value_free(n->value); /* release n's old value */
+        }
+        free(n->key);           /* release n's old key copy */
+        n->key = succ_key;      /* ownership transferred from the successor */
+        n->value = succ_value;  /* ownership transferred from the successor */
+        n->right = new_right;
+
+        *shorter = false;
+        if (succ_shorter) {
+            n = fixup_right_deficit(n, shorter);
+        }
+        return n;
+    }
+
+    if (n->left == NULL && n->right == NULL) {
+        bool was_black = (n->color == BLACK);
+        if (value_free != NULL) {
+            value_free(n->value);
+        }
+        free(n->key);
+        free(n); /* leaf's node struct freed; no children to preserve */
+        *shorter = was_black;
+        return NULL;
+    }
+
+    /* Exactly one child. A black node with one child always has a single red
+     * leaf child (see plan); a red node can never have exactly one child. */
+    struct rb_node *child = (n->left != NULL) ? n->left : n->right;
+    if (value_free != NULL) {
+        value_free(n->value);
+    }
+    free(n->key);
+    free(n); /* n's node struct freed; child subtree reattached in its place */
+    child->color = BLACK;
+    *shorter = false;
+    return child;
 }
 
 /* In-order recursion: left subtree, then n itself, then right subtree —
