@@ -62,3 +62,12 @@ DECIDED: Stuck with spec's description of "hoisting" key and data to doomed node
 LEARNED: Multiple deletion cases can be reduced into simpler ones.
 NEXT FIRST STEP: Implement fuzzer.
 OPEN: Exact requirements for fuzzer. Review deletion cases for personal understanding.
+
+## 2026-09-12
+
+STATE: All green
+DID: Add `rb_validate` calls to relevant unit tests. Implement fuzzer.
+DECIDED: Large sorted array over linked list.
+LEARNED: N/A
+NEXT FIRST STEP: Triple check implementation and tests.
+OPEN: N/A

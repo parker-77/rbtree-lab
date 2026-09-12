@@ -411,6 +411,7 @@ static void test_rb_insert_overwrite_frees_old_value(void) {
     CHECK(rb_insert(t, "key", (void *)0x2) == 0);
     CHECK(free_call_count == 1); /* old value (0x1) freed exactly once */
     CHECK(rb_size(t) == 1);      /* overwrite must not change size */
+    CHECK(rb_validate(t) == 0);
     CHECK(t->root != NULL);
     if (t->root != NULL) {
         CHECK(t->root->value == (void *)0x2);
@@ -455,6 +456,7 @@ static void test_rb_size_tracks_distinct_keys(void) {
 
     CHECK(rb_insert(t, "b", NULL) == 0); /* overwrite: size unchanged */
     CHECK(rb_size(t) == 3);
+    CHECK(rb_validate(t) == 0);
 
     free_node_manual(t->root);
     free(t);
@@ -472,6 +474,7 @@ static void test_rb_find_returns_value_for_present_key(void) {
     CHECK(rb_insert(t, "b", (void *)0xB) == 0);
     CHECK(rb_insert(t, "a", (void *)0xA) == 0);
     CHECK(rb_insert(t, "c", (void *)0xC) == 0);
+    CHECK(rb_validate(t) == 0);
 
     CHECK(rb_find(t, "a") == (void *)0xA);
     CHECK(rb_find(t, "b") == (void *)0xB);
@@ -489,6 +492,7 @@ static void test_rb_find_returns_null_for_absent_key(void) {
     }
 
     CHECK(rb_insert(t, "b", (void *)0xB) == 0);
+    CHECK(rb_validate(t) == 0);
 
     CHECK(rb_find(t, "z") == NULL);
 
@@ -534,6 +538,7 @@ static void test_rb_foreach_visits_in_order(void) {
     CHECK(rb_insert(t, "a", NULL) == 0);
     CHECK(rb_insert(t, "c", NULL) == 0);
     CHECK(rb_insert(t, "e", NULL) == 0);
+    CHECK(rb_validate(t) == 0);
 
     struct collect_ctx c = {.count = 0};
     rb_foreach(t, collect_key, &c);
@@ -581,6 +586,7 @@ static void test_rb_destroy_frees_all_values(void) {
     CHECK(rb_insert(t, "a", (void *)0x2) == 0);
     CHECK(rb_insert(t, "c", (void *)0x3) == 0);
     CHECK(rb_insert(t, "d", (void *)0x4) == 0);
+    CHECK(rb_validate(t) == 0);
 
     free_call_count = 0;
     rb_destroy(t);
@@ -1198,6 +1204,7 @@ static void test_rb_delete_only_node_empties_tree_and_is_reusable(void) {
     /* the tree must still be usable after emptying */
     CHECK(rb_insert(t, "y", (void *)0x5678) == 0);
     CHECK(rb_size(t) == 1);
+    CHECK(rb_validate(t) == 0);
     CHECK(rb_find(t, "y") == (void *)0x5678);
 
     rb_destroy(t);
@@ -1217,6 +1224,7 @@ static void test_rb_delete_frees_value_exactly_once(void) {
     CHECK(rb_delete(t, "k") == 0);
     CHECK(free_call_count == 1);
     CHECK(rb_size(t) == 0);
+    CHECK(rb_validate(t) == 0);
 
     rb_destroy(t);
 }
