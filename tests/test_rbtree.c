@@ -674,12 +674,12 @@ static void test_rb_validate_detects_size_mismatch(void) {
 }
 
 /* --- rb_delete -------------------------------------------------------
- * Covers only the cases that never require a rotation: absent key, red
- * leaf, black node with one red child, two children (successor extraction),
- * and the black-sibling recolor case (5) in both parent-color outcomes.
- * The rotation-requiring cases (red sibling, or black sibling with a red
- * nephew) are a follow-up; fixup_left_deficit/fixup_right_deficit assert
- * on them rather than mishandling them silently.
+ * The cases that never require a rotation: absent key, red leaf, black node
+ * with one red child, two children (successor extraction), and the
+ * black-sibling recolor case (5) in both parent-color outcomes. The
+ * rotation-requiring cases (red sibling, or black sibling with a red
+ * nephew) are covered further down, against fixup_left_deficit and
+ * fixup_right_deficit directly.
  *
  * Nodes that the code under test will genuinely free are built with
  * mknode (a heap key copy via new_node, same as production nodes); nodes
@@ -757,13 +757,11 @@ static void test_fixup_left_deficit_case_b_black_parent_propagates(void) {
 }
 
 /* --- fixup_right_deficit / fixup_left_deficit (cases A, C, D) -----------
- * These exercise the rotation-requiring cases that fixup_*_deficit
- * currently rejects with assert(0) (only case B is implemented). Each
- * expected result below is hand-derived from rotate_left/rotate_right plus
- * black-height bookkeeping, independent of the (not yet written)
- * implementation, so they encode the correct target behavior rather than
- * whatever the code happens to do. Running them against the current
- * assert-guarded stub is expected to abort the process. */
+ * These exercise the rotation-requiring cases of fixup_*_deficit, the ones
+ * case B (recolor only) does not reach. Each expected result below was
+ * hand-derived from rotate_left/rotate_right plus black-height bookkeeping
+ * ahead of the implementation, so they encode the correct target behavior
+ * rather than whatever the code happens to do. */
 
 /* Case A: red sibling. n is red here (rather than black) specifically to
  * prove the new subtree root inherits n's *original* color rather than

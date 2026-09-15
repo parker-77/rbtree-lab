@@ -15,6 +15,13 @@
 #define VALIDATE_INTERVAL 100u
 #define KEY_BUF_LEN 16
 
+/* "k%04u" only keeps lexicographic order equal to numeric order while every
+ * index fits in four digits: at 100000 keys "k10000" would sort before
+ * "k9999" and collect_and_check would report order violations against a
+ * correct tree. Widen the format alongside this bound, not on its own. */
+static_assert(NUM_KEYS <= 10000u,
+              "key format must keep strcmp order equal to index order");
+
 struct model_entry {
     bool present;
     int value;
@@ -160,13 +167,18 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "fuzz: out of memory allocating value\n");
                 return 1;
             }
-            *value = (int)key_idx;
+            /* The payload is the iteration, not the key: every insert for a
+             * given key carries a value no earlier insert could have stored,
+             * so an overwrite that keeps the stale value fails the next
+             * rb_find/rb_foreach check instead of comparing equal to itself. */
+            *value = (int)iter;
 
             int rc = rb_insert(t, key, value);
             if (rc == 0) {
-                /* ownership of value transfers to the tree on success */
+                /* ownership of value transfers to the tree on success, so the
+                 * model records iter directly rather than reading *value */
                 model[key_idx].present = true;
-                model[key_idx].value = *value;
+                model[key_idx].value = (int)iter;
             } else {
                 fprintf(stderr,
                         "fuzz: rb_insert unexpectedly failed at iteration %lu\n",
