@@ -1274,20 +1274,42 @@ static void test_rb_delete_red_leaves_preserve_order(void) {
 /* --- allocation fault sweep ---------------------------------------------
  * One seeded scenario -- rb_create, SWEEP_OPS random insert/overwrite/
  * delete/find calls over a small key space, then rb_destroy -- is dry-run
- * to count its allocations k, then rerun k times with fault_alloc_arm(n) for
- * n = 1..k. The RNG is private and reseeded every run, so every run issues
- * the same call sequence; the fault is one-shot, so each armed run must see
- * exactly one failed call, and that call must leave the tree untouched. */
+ * to count its allocations k and note which call makes each one, then rerun
+ * k times with fault_alloc_arm(n) for n = 1..k. The RNG is private and
+ * reseeded every run, so every run issues the same call sequence and the
+ * dry run's note says exactly which call allocation n will fail in. That
+ * call -- whatever kind it is -- gets the run's one snapshot taken just
+ * before it, and must leave the tree's structure and ownership identical. */
 
-#define SWEEP_OPS 400
+#define SWEEP_OPS 1000
 #define SWEEP_KEYS 32u
 #define SWEEP_KEY_LEN 16
+#define SWEEP_MAX_ALLOCS (1 + 2 * SWEEP_OPS) /* rb_create + 2 per insert */
+#define SWEEP_OP_CREATE (-1) /* the rb_create call, as a call index */
+#define SWEEP_NO_FAULT (-2)  /* dry run: no call is expected to fail */
+
+/* Everything about one node that a failed call could disturb. */
+struct sweep_node_snap {
+    const struct rb_node *node; /* identity of the node allocation */
+    const char *key;            /* identity of the key-copy allocation */
+    char key_text[SWEEP_KEY_LEN];
+    void *value; /* which value the node owns */
+    const struct rb_node *left;
+    const struct rb_node *right;
+    rb_color_t color;
+};
 
 struct sweep_snapshot {
-    size_t count;
-    char keys[SWEEP_KEYS][SWEEP_KEY_LEN];
-    void *values[SWEEP_KEYS];
+    const struct rb_node *root;
+    size_t size;
+    int free_calls; /* values the tree has released via value_free so far */
+    size_t count;   /* nodes reached from root */
+    struct sweep_node_snap nodes[SWEEP_KEYS];
 };
+
+/* sweep_alloc_op[i] is the call that made the dry run's (i+1)-th allocation. */
+static int sweep_alloc_op[SWEEP_MAX_ALLOCS];
+static long sweep_alloc_count;
 
 static uint32_t sweep_rng;
 
@@ -1300,53 +1322,96 @@ static uint32_t sweep_next(void) {
 }
 
 static void sweep_key(unsigned k, char *buf) {
-    snprintf(buf, SWEEP_KEY_LEN, "k%02u", k); /* 2 digits: strcmp order == k order */
+    snprintf(buf, SWEEP_KEY_LEN, "k%02u", k);
 }
 
-static void sweep_record(const char *key, void *value, void *ctx) {
-    struct sweep_snapshot *s = ctx;
+/* Pre-order walk straight over the node structs (not rb_foreach), so the
+ * snapshot records shape and addresses rather than just contents. */
+static void sweep_walk(const struct rb_node *n, struct sweep_snapshot *s) {
+    if (n == NULL) {
+        return;
+    }
     if (s->count < SWEEP_KEYS) {
-        snprintf(s->keys[s->count], SWEEP_KEY_LEN, "%s", key);
-        s->values[s->count] = value;
+        struct sweep_node_snap *snap = &s->nodes[s->count];
+        snap->node = n;
+        snap->key = n->key;
+        snprintf(snap->key_text, SWEEP_KEY_LEN, "%s", n->key);
+        snap->value = n->value;
+        snap->left = n->left;
+        snap->right = n->right;
+        snap->color = n->color;
     }
     s->count++;
+    sweep_walk(n->left, s);
+    sweep_walk(n->right, s);
 }
 
 static void sweep_take(const rbtree_t *t, struct sweep_snapshot *s) {
+    s->root = t->root;
+    s->size = t->size;
+    s->free_calls = free_call_count;
     s->count = 0;
-    rb_foreach(t, sweep_record, s);
+    sweep_walk(t->root, s);
 }
 
 static bool sweep_same(const struct sweep_snapshot *a,
                        const struct sweep_snapshot *b) {
-    if (a->count != b->count || a->count > SWEEP_KEYS) {
+    if (a->root != b->root || a->size != b->size ||
+        a->free_calls != b->free_calls || a->count != b->count ||
+        a->count > SWEEP_KEYS) {
         return false;
     }
     for (size_t i = 0; i < a->count; i++) {
-        if (strcmp(a->keys[i], b->keys[i]) != 0 ||
-            a->values[i] != b->values[i]) {
+        const struct sweep_node_snap *x = &a->nodes[i];
+        const struct sweep_node_snap *y = &b->nodes[i];
+        if (x->node != y->node || x->key != y->key ||
+            strcmp(x->key_text, y->key_text) != 0 || x->value != y->value ||
+            x->left != y->left || x->right != y->right ||
+            x->color != y->color) {
             return false;
         }
     }
     return true;
 }
 
-/* Runs the scenario once. Returns how many calls reported an allocation
- * failure (rb_create returning NULL, or rb_insert returning -1). */
-static int sweep_run(void) {
+/* Dry run only: notes that call `op` made every allocation since `since`. */
+static void sweep_attribute(long since, int op) {
+    /* invariant: allocations before `a` are already attributed to a call */
+    for (long a = since; a < fault_alloc_total(); a++) {
+        if (sweep_alloc_count < SWEEP_MAX_ALLOCS) {
+            sweep_alloc_op[sweep_alloc_count] = op;
+        }
+        sweep_alloc_count++;
+    }
+}
+
+/* Runs the scenario once. fault_op is the call the armed fault will land in
+ * (SWEEP_NO_FAULT for the dry run, which also fills sweep_alloc_op). Returns
+ * how many calls reported an allocation failure: rb_create returning NULL,
+ * rb_insert returning -1, or rb_delete refusing a key that is present. */
+static int sweep_run(int fault_op) {
     struct {
         bool present;
         void *value;
     } model[SWEEP_KEYS] = {0};
     size_t model_size = 0;
     int failures_seen = 0;
+    struct sweep_snapshot before = {0};
+    bool dry_run = fault_op == SWEEP_NO_FAULT;
 
     sweep_rng = 0x2545F491u;
     free_call_count = 0;
+    if (dry_run) {
+        sweep_alloc_count = 0;
+    }
 
+    long allocs_before = fault_alloc_total();
     rbtree_t *t = rb_create(counting_value_free);
     if (t == NULL) {
         return 1; /* create failed; nothing was allocated that could leak */
+    }
+    if (dry_run) {
+        sweep_attribute(allocs_before, SWEEP_OP_CREATE);
     }
 
     /* invariant: model[]/model_size describe t exactly, and free_call_count
@@ -1357,12 +1422,15 @@ static int sweep_run(void) {
         char key[SWEEP_KEY_LEN];
         sweep_key(k, key);
         int frees_before = free_call_count;
+        bool alloc_failed = false;
+        allocs_before = fault_alloc_total();
+
+        if (op == fault_op) {
+            sweep_take(t, &before); /* the run's only "before" snapshot */
+        }
 
         if (kind < 5) {
             void *value = (void *)(uintptr_t)(op + 1); /* unique, non-NULL */
-            struct sweep_snapshot before = {0};
-            sweep_take(t, &before);
-
             if (rb_insert(t, key, value) == 0) {
                 /* an overwrite releases exactly the old value; a new key
                  * releases nothing */
@@ -1374,45 +1442,53 @@ static int sweep_run(void) {
                 model[k].present = true;
                 model[k].value = value; /* ownership of value moved to t */
             } else {
-                failures_seen++;
-                struct sweep_snapshot after = {0};
-                sweep_take(t, &after);
-                CHECK(sweep_same(&before, &after));
-                /* value not consumed, and no old value released */
-                CHECK(free_call_count == frees_before);
+                alloc_failed = true; /* value not consumed; still ours */
             }
         } else if (kind < 8) {
-            CHECK(rb_delete(t, key) == (model[k].present ? 0 : -1));
-            if (model[k].present) {
+            int rc = rb_delete(t, key);
+            if (!model[k].present) {
+                CHECK(rc == -1);
+                CHECK(free_call_count == frees_before);
+                /* -1 is rb_delete's only error code, so a fault landing
+                 * here surfaces as the same -1 that "absent" does */
+                alloc_failed = op == fault_op;
+            } else if (rc == 0) {
                 CHECK(free_call_count == frees_before + 1);
-                model[k].present = false;
+                model[k].present = false; /* t released the node, key, value */
                 model_size--;
             } else {
-                CHECK(free_call_count == frees_before);
+                /* a present key was not removed: only a failed allocation
+                 * explains that, so t must still own all of it */
+                alloc_failed = true;
             }
         } else {
             CHECK(rb_find(t, key) == (model[k].present ? model[k].value : NULL));
+        }
+
+        if (op == fault_op) {
+            struct sweep_snapshot after = {0};
+            sweep_take(t, &after);
+            CHECK(alloc_failed); /* the injected fault surfaced as an error */
+            /* same nodes, same key copies, same values, same links and
+             * colors, and nothing handed to value_free */
+            CHECK(sweep_same(&before, &after));
+        } else {
+            CHECK(!alloc_failed);
+        }
+        failures_seen += alloc_failed;
+        if (dry_run) {
+            sweep_attribute(allocs_before, op);
         }
 
         CHECK(rb_validate(t) == 0);
         CHECK(rb_size(t) == model_size);
     }
 
-    struct sweep_snapshot end = {0};
-    sweep_take(t, &end);
-    CHECK(end.count == model_size);
-    size_t i = 0;
-    /* invariant: i counts the present model keys below k, which is also
-     * their position in the in-order snapshot */
+    /* invariant: every key below k has been checked against the model */
     for (unsigned k = 0; k < SWEEP_KEYS; k++) {
-        if (!model[k].present) {
-            continue;
-        }
         char key[SWEEP_KEY_LEN];
         sweep_key(k, key);
-        CHECK(i < end.count && strcmp(end.keys[i], key) == 0 &&
-              end.values[i] == model[k].value);
-        i++;
+        CHECK(rb_find(t, key) == (model[k].present ? model[k].value : NULL));
     }
 
     int frees_before = free_call_count;
@@ -1423,9 +1499,14 @@ static int sweep_run(void) {
 
 static void test_fault_sweep(void) {
     long before = fault_alloc_total();
-    CHECK(sweep_run() == 0); /* dry run: unarmed, so nothing may fail */
+    CHECK(sweep_run(SWEEP_NO_FAULT) == 0); /* dry run: nothing may fail */
     long total = fault_alloc_total() - before;
     CHECK(total > 0);
+    /* every allocation was attributed to the call that made it */
+    CHECK(total == sweep_alloc_count && total <= SWEEP_MAX_ALLOCS);
+    if (total != sweep_alloc_count || total > SWEEP_MAX_ALLOCS) {
+        return;
+    }
 
     /* invariant: runs 1..n-1 each injected exactly one failure, and every
      * check around it passed or was reported with its n */
@@ -1434,7 +1515,7 @@ static void test_fault_sweep(void) {
         long start = fault_alloc_total();
 
         fault_alloc_arm(n);
-        int seen = sweep_run();
+        int seen = sweep_run(sweep_alloc_op[n - 1]);
         fault_alloc_disarm();
 
         CHECK(fault_alloc_total() - start >= n); /* the n-th alloc happened */
