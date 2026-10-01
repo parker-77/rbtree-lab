@@ -1,4 +1,5 @@
 #include "rbtree.h"
+#include "../tests/fault_alloc.h"
 
 #include <assert.h>
 #include <stdbool.h>
@@ -47,7 +48,7 @@ static int validate_rec(const struct rb_node *n, const char **prev_key,
 
 /* Allocates an empty tree. Returns NULL on allocation failure. */
 rbtree_t *rb_create(rb_value_free_fn value_free) {
-    struct rbtree *t = malloc(sizeof *t);
+    struct rbtree *t = rb_malloc(sizeof *t);
     if (t == NULL) {
         return NULL;
     }
@@ -139,19 +140,19 @@ void rb_destroy(rbtree_t *t) {
         return;
     }
     destroy_rec(t->root, t->value_free);
-    free(t);
+    rb_free(t);
 }
 
 /* Allocates a new red leaf node, copying key. Returns NULL on allocation
  * failure (nothing allocated survives such a failure). */
 static struct rb_node *new_node(const char *key, void *value) {
-    struct rb_node *n = malloc(sizeof *n);
+    struct rb_node *n = rb_malloc(sizeof *n);
     if (n == NULL) {
         return NULL;
     }
 
     size_t key_len = strlen(key) + 1;
-    char *key_copy = malloc(key_len);
+    char *key_copy = rb_malloc(key_len);
     if (key_copy == NULL) {
         goto cleanup_node;
     }
@@ -165,7 +166,7 @@ static struct rb_node *new_node(const char *key, void *value) {
     return n;
 
 cleanup_node:
-    free(n);
+    rb_free(n);
     return NULL;
 }
 
@@ -441,7 +442,7 @@ static struct rb_node *extract_min(struct rb_node *n, char **out_key,
         *out_value = n->value; /* ownership transferred to caller */
         struct rb_node *right = n->right;
         bool was_black = (n->color == BLACK);
-        free(n); /* node struct freed; key/value ownership already moved out */
+        rb_free(n); /* node struct freed; key/value ownership already moved out */
 
         if (right != NULL) {
             right->color = BLACK; /* case 6: red child absorbs the black n had */
@@ -511,7 +512,7 @@ static struct rb_node *delete_rec(struct rb_node *n, const char *key,
         if (value_free != NULL) {
             value_free(n->value); /* release n's old value */
         }
-        free(n->key);           /* release n's old key copy */
+        rb_free(n->key);        /* release n's old key copy */
         n->key = succ_key;      /* ownership transferred from the successor */
         n->value = succ_value;  /* ownership transferred from the successor */
         n->right = new_right;
@@ -528,8 +529,8 @@ static struct rb_node *delete_rec(struct rb_node *n, const char *key,
         if (value_free != NULL) {
             value_free(n->value);
         }
-        free(n->key);
-        free(n); /* leaf's node struct freed; no children to preserve */
+        rb_free(n->key);
+        rb_free(n); /* leaf's node struct freed; no children to preserve */
         *shorter = was_black;
         return NULL;
     }
@@ -540,8 +541,8 @@ static struct rb_node *delete_rec(struct rb_node *n, const char *key,
     if (value_free != NULL) {
         value_free(n->value);
     }
-    free(n->key);
-    free(n); /* n's node struct freed; child subtree reattached in its place */
+    rb_free(n->key);
+    rb_free(n); /* n's node struct freed; child subtree reattached in its place */
     child->color = BLACK;
     *shorter = false;
     return child;
@@ -574,8 +575,8 @@ static void destroy_rec(struct rb_node *n, rb_value_free_fn value_free) {
     if (value_free != NULL) {
         value_free(n->value); /* tree relinquishes ownership of value */
     }
-    free(n->key);
-    free(n); /* tree relinquishes ownership of the node itself */
+    rb_free(n->key);
+    rb_free(n); /* tree relinquishes ownership of the node itself */
 }
 
 /* Returns this subtree's black-height (>= 0), or -1 if a violation was found

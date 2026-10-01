@@ -5,6 +5,7 @@ CFLAGS       := -std=c23 -Wall -Wextra -Werror -g $(OPT) -Iinclude $(EXTRA_CFLAG
 
 SRC     := src/rbtree.c
 TSRC    := tests/test_rbtree.c
+FAULT   := tests/fault_alloc.c
 BIN     := build/test_rbtree
 FUZZBIN := build/fuzz
 
@@ -27,13 +28,13 @@ all: $(BIN) $(FUZZBIN)
 # tests/test_rbtree.c #includes src/rbtree.c (unity build), so $(SRC) is a
 # prerequisite but must NOT be handed to the compiler -- that would define
 # every symbol twice.
-$(BIN): $(SRC) $(TSRC) include/rbtree.h
+$(BIN): $(SRC) $(TSRC) $(FAULT) tests/fault_alloc.h include/rbtree.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) $(TSRC) -o $@
+	$(CC) $(CFLAGS) $(TSRC) $(FAULT) -o $@
 
-$(FUZZBIN): $(SRC) tests/fuzz.c include/rbtree.h
+$(FUZZBIN): $(SRC) tests/fuzz.c $(FAULT) tests/fault_alloc.h include/rbtree.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) $(SRC) tests/fuzz.c -o $@
+	$(CC) $(CFLAGS) $(SRC) tests/fuzz.c $(FAULT) -o $@
 
 test: $(BIN) $(FUZZBIN)
 	./$(BIN) && ./$(FUZZBIN) 100000

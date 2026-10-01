@@ -31,8 +31,8 @@ static void test_new_node_sets_fields(void) {
     CHECK(n->left == NULL);
     CHECK(n->right == NULL);
 
-    free(n->key);
-    free(n);
+    rb_free(n->key);
+    rb_free(n);
 }
 
 /* The header contract says the tree copies the key; prove new_node doesn't
@@ -58,8 +58,8 @@ static void test_new_node_copies_key(void) {
     CHECK((uintptr_t)n->key != buf_addr);
     CHECK(strcmp(n->key, "alpha") == 0);
 
-    free(n->key);
-    free(n);
+    rb_free(n->key);
+    rb_free(n);
 }
 
 /* --- is_red ----------------------------------------------------------- */
@@ -318,8 +318,8 @@ static void test_insert_rec_attaches_new_leaf(void) {
     CHECK(newleaf->value == (void *)0xABCD);
     CHECK(newleaf->left == NULL && newleaf->right == NULL);
 
-    free(newleaf->key);
-    free(newleaf);
+    rb_free(newleaf->key);
+    rb_free(newleaf);
 }
 
 /* Two levels of recursion: the new leaf attaches under the red node l, whose
@@ -353,8 +353,8 @@ static void test_insert_rec_two_level_ll_violation(void) {
     CHECK(strcmp(newleaf->key, "c") == 0);
     CHECK(newleaf->value == (void *)0xC0FFEE);
 
-    free(newleaf->key);
-    free(newleaf);
+    rb_free(newleaf->key);
+    rb_free(newleaf);
 }
 
 /* --- rb_create / value_free ---------------------------------------------
@@ -375,7 +375,7 @@ static void test_rb_create_sets_fields(void) {
     CHECK(t->value_free == NULL);
     CHECK(t->size == 0);
 
-    free(t);
+    rb_free(t);
 }
 
 static void test_rb_create_stores_value_free(void) {
@@ -386,7 +386,7 @@ static void test_rb_create_stores_value_free(void) {
     }
     CHECK(t->value_free == dummy_value_free);
 
-    free(t);
+    rb_free(t);
 }
 
 static int free_call_count = 0;
@@ -416,10 +416,10 @@ static void test_rb_insert_overwrite_frees_old_value(void) {
     if (t->root != NULL) {
         CHECK(t->root->value == (void *)0x2);
         CHECK(strcmp(t->root->key, "key") == 0);
-        free(t->root->key);
-        free(t->root);
+        rb_free(t->root->key);
+        rb_free(t->root);
     }
-    free(t);
+    rb_free(t);
 }
 
 /* --- rb_size -------------------------------------------------------------
@@ -432,8 +432,8 @@ static void free_node_manual(struct rb_node *n) {
     }
     free_node_manual(n->left);
     free_node_manual(n->right);
-    free(n->key);
-    free(n);
+    rb_free(n->key);
+    rb_free(n);
 }
 
 static void test_rb_size_tracks_distinct_keys(void) {
@@ -459,7 +459,7 @@ static void test_rb_size_tracks_distinct_keys(void) {
     CHECK(rb_validate(t) == 0);
 
     free_node_manual(t->root);
-    free(t);
+    rb_free(t);
 }
 
 /* --- rb_find --------------------------------------------------------- */
@@ -481,7 +481,7 @@ static void test_rb_find_returns_value_for_present_key(void) {
     CHECK(rb_find(t, "c") == (void *)0xC);
 
     free_node_manual(t->root);
-    free(t);
+    rb_free(t);
 }
 
 static void test_rb_find_returns_null_for_absent_key(void) {
@@ -497,7 +497,7 @@ static void test_rb_find_returns_null_for_absent_key(void) {
     CHECK(rb_find(t, "z") == NULL);
 
     free_node_manual(t->root);
-    free(t);
+    rb_free(t);
 }
 
 static void test_rb_find_on_empty_tree_returns_null(void) {
@@ -509,7 +509,7 @@ static void test_rb_find_on_empty_tree_returns_null(void) {
 
     CHECK(rb_find(t, "anything") == NULL);
 
-    free(t);
+    rb_free(t);
 }
 
 /* --- rb_foreach --------------------------------------------------------- */
@@ -552,7 +552,7 @@ static void test_rb_foreach_visits_in_order(void) {
     }
 
     free_node_manual(t->root);
-    free(t);
+    rb_free(t);
 }
 
 static void test_rb_foreach_on_empty_tree_does_nothing(void) {
@@ -567,7 +567,7 @@ static void test_rb_foreach_on_empty_tree_does_nothing(void) {
 
     CHECK(c.count == 0);
 
-    free(t);
+    rb_free(t);
 }
 
 /* --- rb_destroy ----------------------------------------------------------
@@ -957,14 +957,14 @@ static void test_extract_min_walks_to_deepest_left_leaf(void) {
     CHECK(g->right == NULL);
     CHECK(h->right == j);
 
-    free(out_key); /* ownership of e's key returned to us; e's struct is
-                       already freed by extract_min */
-    free(g->key);
-    free(g);
-    free(j->key);
-    free(j);
-    free(h->key);
-    free(h);
+    rb_free(out_key); /* ownership of e's key returned to us; e's struct is
+                          already freed by extract_min */
+    rb_free(g->key);
+    rb_free(g);
+    rb_free(j->key);
+    rb_free(j);
+    rb_free(h->key);
+    rb_free(h);
 }
 
 /* --- delete_rec ----------------------------------------------------------
@@ -1009,8 +1009,8 @@ static void test_delete_rec_red_leaf_no_fixup(void) {
     CHECK(root->right == NULL);
     CHECK(root->color == BLACK);
 
-    free(root->key);
-    free(root);
+    rb_free(root->key);
+    rb_free(root);
 }
 
 /* Case 6: black node with one red child; child is recolored black and promoted. */
@@ -1037,12 +1037,12 @@ static void test_delete_rec_black_node_with_one_red_child(void) {
     CHECK(e->left == NULL && e->right == NULL);
     CHECK(root->right == z);
 
-    free(e->key);
-    free(e);
-    free(z->key);
-    free(z);
-    free(root->key);
-    free(root);
+    rb_free(e->key);
+    rb_free(e);
+    rb_free(z->key);
+    rb_free(z);
+    rb_free(root->key);
+    rb_free(root);
 }
 
 /* Two children; the in-order successor is itself a red leaf, so extracting
@@ -1072,13 +1072,13 @@ static void test_delete_rec_two_children_successor_is_red_leaf(void) {
     CHECK(h->left == NULL); /* f's old slot under h is now empty */
     CHECK(h->right == NULL);
 
-    free(new_root->key); /* frees f's key, now owned by d's slot */
-    free(new_root);       /* frees d's struct; f's struct was already freed
-                              inside extract_min */
-    free(b->key);
-    free(b);
-    free(h->key);
-    free(h);
+    rb_free(new_root->key); /* frees f's key, now owned by d's slot */
+    rb_free(new_root);      /* frees d's struct; f's struct was already freed
+                               inside extract_min */
+    rb_free(b->key);
+    rb_free(b);
+    rb_free(h->key);
+    rb_free(h);
 }
 
 /* Two children; the in-order successor is a black node with one red child,
@@ -1107,13 +1107,13 @@ static void test_delete_rec_two_children_successor_has_red_child(void) {
     CHECK(p->color == BLACK);
     CHECK(p->left == NULL && p->right == NULL);
 
-    free(new_root->key); /* frees k's key, now owned by d's slot */
-    free(new_root);       /* frees d's struct; k's struct was already freed
-                              inside extract_min */
-    free(b->key);
-    free(b);
-    free(p->key);
-    free(p);
+    rb_free(new_root->key); /* frees k's key, now owned by d's slot */
+    rb_free(new_root);      /* frees d's struct; k's struct was already freed
+                               inside extract_min */
+    rb_free(b->key);
+    rb_free(b);
+    rb_free(p->key);
+    rb_free(p);
 }
 
 /* Black leaf deleted under a red parent whose other child is a black
@@ -1271,6 +1271,181 @@ static void test_rb_delete_red_leaves_preserve_order(void) {
     rb_destroy(t);
 }
 
+/* --- allocation fault sweep ---------------------------------------------
+ * One seeded scenario -- rb_create, SWEEP_OPS random insert/overwrite/
+ * delete/find calls over a small key space, then rb_destroy -- is dry-run
+ * to count its allocations k, then rerun k times with fault_alloc_arm(n) for
+ * n = 1..k. The RNG is private and reseeded every run, so every run issues
+ * the same call sequence; the fault is one-shot, so each armed run must see
+ * exactly one failed call, and that call must leave the tree untouched. */
+
+#define SWEEP_OPS 400
+#define SWEEP_KEYS 32u
+#define SWEEP_KEY_LEN 16
+
+struct sweep_snapshot {
+    size_t count;
+    char keys[SWEEP_KEYS][SWEEP_KEY_LEN];
+    void *values[SWEEP_KEYS];
+};
+
+static uint32_t sweep_rng;
+
+/* xorshift32: private so the sweep neither consumes nor depends on rand(). */
+static uint32_t sweep_next(void) {
+    sweep_rng ^= sweep_rng << 13;
+    sweep_rng ^= sweep_rng >> 17;
+    sweep_rng ^= sweep_rng << 5;
+    return sweep_rng;
+}
+
+static void sweep_key(unsigned k, char *buf) {
+    snprintf(buf, SWEEP_KEY_LEN, "k%02u", k); /* 2 digits: strcmp order == k order */
+}
+
+static void sweep_record(const char *key, void *value, void *ctx) {
+    struct sweep_snapshot *s = ctx;
+    if (s->count < SWEEP_KEYS) {
+        snprintf(s->keys[s->count], SWEEP_KEY_LEN, "%s", key);
+        s->values[s->count] = value;
+    }
+    s->count++;
+}
+
+static void sweep_take(const rbtree_t *t, struct sweep_snapshot *s) {
+    s->count = 0;
+    rb_foreach(t, sweep_record, s);
+}
+
+static bool sweep_same(const struct sweep_snapshot *a,
+                       const struct sweep_snapshot *b) {
+    if (a->count != b->count || a->count > SWEEP_KEYS) {
+        return false;
+    }
+    for (size_t i = 0; i < a->count; i++) {
+        if (strcmp(a->keys[i], b->keys[i]) != 0 ||
+            a->values[i] != b->values[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Runs the scenario once. Returns how many calls reported an allocation
+ * failure (rb_create returning NULL, or rb_insert returning -1). */
+static int sweep_run(void) {
+    struct {
+        bool present;
+        void *value;
+    } model[SWEEP_KEYS] = {0};
+    size_t model_size = 0;
+    int failures_seen = 0;
+
+    sweep_rng = 0x2545F491u;
+    free_call_count = 0;
+
+    rbtree_t *t = rb_create(counting_value_free);
+    if (t == NULL) {
+        return 1; /* create failed; nothing was allocated that could leak */
+    }
+
+    /* invariant: model[]/model_size describe t exactly, and free_call_count
+     * equals the number of values t has handed to value_free so far. */
+    for (int op = 0; op < SWEEP_OPS; op++) {
+        unsigned k = sweep_next() % SWEEP_KEYS;
+        unsigned kind = sweep_next() % 10;
+        char key[SWEEP_KEY_LEN];
+        sweep_key(k, key);
+        int frees_before = free_call_count;
+
+        if (kind < 5) {
+            void *value = (void *)(uintptr_t)(op + 1); /* unique, non-NULL */
+            struct sweep_snapshot before = {0};
+            sweep_take(t, &before);
+
+            if (rb_insert(t, key, value) == 0) {
+                /* an overwrite releases exactly the old value; a new key
+                 * releases nothing */
+                CHECK(free_call_count ==
+                      frees_before + (model[k].present ? 1 : 0));
+                if (!model[k].present) {
+                    model_size++;
+                }
+                model[k].present = true;
+                model[k].value = value; /* ownership of value moved to t */
+            } else {
+                failures_seen++;
+                struct sweep_snapshot after = {0};
+                sweep_take(t, &after);
+                CHECK(sweep_same(&before, &after));
+                /* value not consumed, and no old value released */
+                CHECK(free_call_count == frees_before);
+            }
+        } else if (kind < 8) {
+            CHECK(rb_delete(t, key) == (model[k].present ? 0 : -1));
+            if (model[k].present) {
+                CHECK(free_call_count == frees_before + 1);
+                model[k].present = false;
+                model_size--;
+            } else {
+                CHECK(free_call_count == frees_before);
+            }
+        } else {
+            CHECK(rb_find(t, key) == (model[k].present ? model[k].value : NULL));
+        }
+
+        CHECK(rb_validate(t) == 0);
+        CHECK(rb_size(t) == model_size);
+    }
+
+    struct sweep_snapshot end = {0};
+    sweep_take(t, &end);
+    CHECK(end.count == model_size);
+    size_t i = 0;
+    /* invariant: i counts the present model keys below k, which is also
+     * their position in the in-order snapshot */
+    for (unsigned k = 0; k < SWEEP_KEYS; k++) {
+        if (!model[k].present) {
+            continue;
+        }
+        char key[SWEEP_KEY_LEN];
+        sweep_key(k, key);
+        CHECK(i < end.count && strcmp(end.keys[i], key) == 0 &&
+              end.values[i] == model[k].value);
+        i++;
+    }
+
+    int frees_before = free_call_count;
+    rb_destroy(t); /* t's nodes, key copies, and tree struct freed */
+    CHECK(free_call_count == frees_before + (int)model_size);
+    return failures_seen;
+}
+
+static void test_fault_sweep(void) {
+    long before = fault_alloc_total();
+    CHECK(sweep_run() == 0); /* dry run: unarmed, so nothing may fail */
+    long total = fault_alloc_total() - before;
+    CHECK(total > 0);
+
+    /* invariant: runs 1..n-1 each injected exactly one failure, and every
+     * check around it passed or was reported with its n */
+    for (long n = 1; n <= total; n++) {
+        int failures_before = failures;
+        long start = fault_alloc_total();
+
+        fault_alloc_arm(n);
+        int seen = sweep_run();
+        fault_alloc_disarm();
+
+        CHECK(fault_alloc_total() - start >= n); /* the n-th alloc happened */
+        CHECK(seen == 1);
+        if (failures != failures_before) {
+            fprintf(stderr, "  ^ fault sweep: failed with n=%ld of %ld\n", n,
+                    total);
+        }
+    }
+}
+
 int main(void) {
     test_new_node_sets_fields();
     test_new_node_copies_key();
@@ -1327,6 +1502,7 @@ int main(void) {
     test_fixup_right_deficit_case_d_red_near_nephew();
     test_fixup_left_deficit_case_d_red_near_nephew();
     test_delete_rec_black_leaf_no_black_sibling_case_7();
+    test_fault_sweep();
 
     if (failures == 0) {
         printf("all tests passed\n");
