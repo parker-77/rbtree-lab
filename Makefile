@@ -25,10 +25,10 @@ DOCKER_RUN := docker run --rm -v "$(CURDIR)":/work -v /work/build -w /work $(IMA
 
 all: $(BIN) $(FUZZBIN)
 
-# tests/test_rbtree.c #includes src/rbtree.c (unity build), so $(SRC) is a
-# prerequisite but must NOT be handed to the compiler -- that would define
-# every symbol twice.
-$(BIN): $(SRC) $(TSRC) $(FAULT) tests/fault_alloc.h include/rbtree.h
+# tests/test_rbtree.c #includes src/rbtree.c and src/pool.c (unity build), so
+# both are prerequisites but must NOT be handed to the compiler -- that would
+# define every symbol twice.
+$(BIN): $(SRC) src/pool.c $(TSRC) $(FAULT) tests/fault_alloc.h include/rbtree.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(TSRC) $(FAULT) -o $@
 

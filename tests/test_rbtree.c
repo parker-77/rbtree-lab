@@ -3,6 +3,9 @@
  * unit-test them directly, instead of only through the public rbtree_t
  * API. */
 #include "../src/rbtree.c"
+/* Same for the slab pool: exposes struct rb_pool/struct slab so the pool
+ * tests can read per_slab and walk slabs directly. */
+#include "../src/pool.c"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -1527,6 +1530,326 @@ static void test_fault_sweep(void) {
     }
 }
 
+/* --- slab pool (src/pool.c) ---------------------------------------------
+ * Every pool_alloc/pool_free below goes through checked_alloc/checked_free,
+ * which assert the slot-accounting invariant before and after the call and
+ * the exact counter change the call must cause. The pointer-validity checks
+ * deliberately kept out of pool.c live here instead. */
+
+/* Slot 0 is aligned iff the in-band header size preserves malloc's alignment. */
+static_assert(offsetof(struct slab, mem) % alignof(max_align_t) == 0,
+              "slab header must preserve max_align_t alignment");
+
+#define POOL_HEADER offsetof(struct slab, mem)
+#define POOL_MAX_HELD 1024u /* > 2 * per_slab for any obj_size >= 1 */
+#define POOL_SWEEP_OPS 600  /* ~70% allocs: spans at least two slabs */
+
+struct pool_counts {
+    size_t slabs;
+    size_t live;
+    size_t free_objs;
+};
+
+/* Reads stats and checks the slot-accounting invariant. */
+static struct pool_counts pool_check(const rb_pool_t *p) {
+    struct pool_counts c;
+    pool_stats(p, &c.slabs, &c.live, &c.free_objs);
+    CHECK(c.live + c.free_objs == c.slabs * p->per_slab);
+    return c;
+}
+
+/* True iff obj is exactly a slot boundary inside one of p's slabs. */
+static bool slot_owned(const rb_pool_t *p, const void *obj) {
+    uintptr_t a = (uintptr_t)obj; /* integer compare: relational ops across distinct objects are UB */
+    /* invariant: obj lies in none of the slabs visited before s */
+    for (const struct slab *s = p->slabs; s != NULL; s = s->next) {
+        uintptr_t lo = (uintptr_t)s->mem;
+        uintptr_t hi = lo + p->per_slab * p->slot_size;
+        if (a >= lo && a < hi) {
+            return (a - lo) % p->slot_size == 0; /* rejects mid-slot pointers */
+        }
+    }
+    return false;
+}
+
+/* failure: nothing changes. success: live+1, and free-1 unless the call grew
+ * the pool, in which case slabs+1 and free jumps by a whole slab minus one. */
+static void check_alloc_delta(const rb_pool_t *p, struct pool_counts b,
+                              const void *got) {
+    struct pool_counts a = pool_check(p);
+    if (got == NULL) {
+        CHECK(a.slabs == b.slabs && a.live == b.live &&
+              a.free_objs == b.free_objs);
+    } else if (a.slabs == b.slabs + 1) {
+        CHECK(b.free_objs == 0); /* only an empty free list may grow */
+        CHECK(a.live == b.live + 1 &&
+              a.free_objs == b.free_objs + p->per_slab - 1);
+    } else {
+        CHECK(a.slabs == b.slabs && a.live == b.live + 1 &&
+              a.free_objs == b.free_objs - 1);
+    }
+}
+
+/* pool_free of a live slot: live-1, free+1, slabs unchanged. */
+static void check_free_delta(const rb_pool_t *p, struct pool_counts b) {
+    struct pool_counts a = pool_check(p);
+    CHECK(a.slabs == b.slabs && a.live == b.live - 1 &&
+          a.free_objs == b.free_objs + 1);
+}
+
+/* pool_alloc wrapped in the invariant, delta, ownership and alignment checks. */
+static void *checked_alloc(rb_pool_t *p) {
+    struct pool_counts b = pool_check(p);
+    void *got = pool_alloc(p);
+    check_alloc_delta(p, b, got);
+    if (got != NULL) {
+        CHECK(slot_owned(p, got));
+        CHECK((uintptr_t)got % alignof(max_align_t) == 0);
+    }
+    return got; /* caller now owns the slot (if non-NULL) */
+}
+
+/* pool_free wrapped in the same checks; refuses pointers the pool doesn't own. */
+static void checked_free(rb_pool_t *p, void *obj) {
+    bool owned = slot_owned(p, obj);
+    CHECK(owned);
+    if (!owned) {
+        return; /* a foreign pointer would poison the free list */
+    }
+    struct pool_counts b = pool_check(p);
+    pool_free(p, obj); /* slot ownership returns to the pool */
+    check_free_delta(p, b);
+}
+
+static void test_pool_create_rejects_bad_sizes(void) {
+    long before = fault_alloc_total();
+    CHECK(pool_create(0) == NULL);
+    CHECK(pool_create(SLAB_BYTES - POOL_HEADER + 1) == NULL); /* can't fit one slot */
+    CHECK(pool_create(SIZE_MAX) == NULL); /* would overflow round_up unguarded */
+    CHECK(fault_alloc_total() == before); /* rejected before any allocation */
+}
+
+static void check_pool_geometry(size_t obj_size) {
+    rb_pool_t *p = pool_create(obj_size);
+    CHECK(p != NULL);
+    if (p == NULL) {
+        return;
+    }
+    CHECK(p->slot_size >= obj_size);
+    CHECK(p->slot_size >= sizeof(struct free_slot)); /* room for the link */
+    CHECK(p->slot_size % alignof(max_align_t) == 0);
+    CHECK(p->per_slab >= 1);
+    CHECK(POOL_HEADER + p->per_slab * p->slot_size <= SLAB_BYTES);
+    CHECK(POOL_HEADER + (p->per_slab + 1) * p->slot_size > SLAB_BYTES); /* maximal */
+    struct pool_counts c = pool_check(p);
+    CHECK(c.slabs == 0 && c.live == 0 && c.free_objs == 0); /* slabs are lazy */
+    pool_destroy(p); /* p freed; it owned no slabs */
+}
+
+static void test_pool_create_geometry(void) {
+    check_pool_geometry(sizeof(struct rb_node));
+    check_pool_geometry(1);
+    check_pool_geometry(SLAB_BYTES - POOL_HEADER); /* largest accepted size */
+
+    rb_pool_t *p = pool_create(SLAB_BYTES - POOL_HEADER);
+    CHECK(p != NULL && p->per_slab == 1);
+    pool_destroy(p); /* p freed; it owned no slabs */
+}
+
+static void test_pool_alloc_grows_and_reuses_lifo(void) {
+    rb_pool_t *p = pool_create(sizeof(struct rb_node));
+    CHECK(p != NULL);
+    if (p == NULL) {
+        return;
+    }
+    size_t n = p->per_slab + 1; /* one past a full slab forces a second slab */
+    CHECK(n <= POOL_MAX_HELD);
+    void *held[POOL_MAX_HELD];
+
+    /* invariant: held[0..i-1] are live, and those from the first slab are
+     * consecutive slots in ascending address order */
+    for (size_t i = 0; i < n; i++) {
+        held[i] = checked_alloc(p); /* test owns held[i] */
+        CHECK(held[i] != NULL);
+        if (i > 0 && i < p->per_slab) {
+            CHECK((uintptr_t)held[i] == (uintptr_t)held[i - 1] + p->slot_size);
+        }
+    }
+    CHECK(pool_check(p).slabs == 2);
+    /* invariant: the second slab's slot differs from every slot before j */
+    for (size_t j = 0; j + 1 < n; j++) {
+        CHECK(held[j] != held[n - 1]);
+    }
+
+    /* LIFO: the last slot freed is the next one handed out */
+    void *a = held[1];
+    void *b = held[n / 2];
+    checked_free(p, a);
+    checked_free(p, b);
+    CHECK(checked_alloc(p) == b);
+    CHECK(checked_alloc(p) == a); /* test owns a and b again */
+
+    /* invariant: held[i..n-1] are still live */
+    for (size_t i = 0; i < n; i++) {
+        checked_free(p, held[i]);
+    }
+    struct pool_counts c = pool_check(p);
+    CHECK(c.live == 0 && c.slabs == 2 && c.free_objs == 2 * p->per_slab);
+
+    /* freed slots from both slabs are reused before the pool grows again */
+    size_t full = 2 * p->per_slab;
+    CHECK(full <= POOL_MAX_HELD);
+    /* invariant: held[0..i-1] are live and no third slab exists */
+    for (size_t i = 0; i < full; i++) {
+        held[i] = checked_alloc(p);
+        CHECK(held[i] != NULL);
+    }
+    CHECK(pool_check(p).slabs == 2);
+    /* invariant: held[i..full-1] are still live */
+    for (size_t i = 0; i < full; i++) {
+        checked_free(p, held[i]);
+    }
+    pool_destroy(p); /* both slabs and p freed */
+}
+
+static unsigned char slot_pattern(size_t i) {
+    return (unsigned char)(i % 251 + 1); /* adjacent slots always differ */
+}
+
+/* Fills every byte of every slot in two slabs, then confirms each slot kept
+ * its own pattern: slots tile without overlapping each other or the header
+ * (pool_destroy then walks the in-band links, which a stray write would have
+ * corrupted; ASan catches anything past the 4096-byte block). */
+static void test_pool_full_slot_writes(void) {
+    rb_pool_t *p = pool_create(sizeof(struct rb_node));
+    CHECK(p != NULL);
+    if (p == NULL) {
+        return;
+    }
+    size_t n = 2 * p->per_slab;
+    CHECK(n <= POOL_MAX_HELD);
+    void *held[POOL_MAX_HELD];
+
+    /* invariant: held[0..i-1] are live and filled with their own pattern */
+    for (size_t i = 0; i < n; i++) {
+        held[i] = checked_alloc(p); /* test owns held[i] */
+        CHECK(held[i] != NULL);
+        if (held[i] == NULL) {
+            n = i; /* only free what was handed out */
+            break;
+        }
+        memset(held[i], slot_pattern(i), p->slot_size);
+    }
+    /* invariant: slots 0..i-1 still hold exactly their own pattern */
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char *bytes = held[i];
+        bool intact = true;
+        /* invariant: bytes[0..j-1] match slot i's pattern */
+        for (size_t j = 0; j < p->slot_size; j++) {
+            intact = intact && bytes[j] == slot_pattern(i);
+        }
+        CHECK(intact);
+    }
+    /* invariant: held[i..n-1] are still live */
+    for (size_t i = 0; i < n; i++) {
+        checked_free(p, held[i]);
+    }
+    pool_destroy(p); /* both slabs and p freed */
+}
+
+static void test_pool_null_handling(void) {
+    pool_destroy(NULL); /* no-op */
+
+    rb_pool_t *p = pool_create(sizeof(struct rb_node));
+    CHECK(p != NULL);
+    if (p == NULL) {
+        return;
+    }
+    void *obj = checked_alloc(p); /* test owns obj */
+    CHECK(obj != NULL);
+
+    struct pool_counts b = pool_check(p);
+    pool_free(p, NULL); /* no-op: nothing to return */
+    struct pool_counts a = pool_check(p);
+    CHECK(a.slabs == b.slabs && a.live == b.live && a.free_objs == b.free_objs);
+
+    size_t live = 0;
+    pool_stats(p, NULL, &live, NULL); /* NULL out-params are skipped */
+    CHECK(live == 1);
+    pool_stats(p, NULL, NULL, NULL);
+
+    checked_free(p, obj);
+    pool_destroy(p); /* the slab and p freed */
+}
+
+/* Runs the seeded alloc/free scenario once. Returns how many calls reported
+ * an allocation failure: pool_create returning NULL or pool_alloc returning
+ * NULL. Every run frees everything it holds and destroys the pool, so
+ * Valgrind sees any leak on a failure path. */
+static int pool_sweep_run(void) {
+    void *held[POOL_MAX_HELD];
+    size_t nheld = 0;
+    int failures_seen = 0;
+
+    sweep_rng = 0x9E3779B9u; /* reseeded: every run makes the same calls up
+                                to the injected failure */
+    rb_pool_t *p = pool_create(sizeof(struct rb_node));
+    if (p == NULL) {
+        return 1; /* create failed; nothing was allocated that could leak */
+    }
+
+    /* invariant: held[0..nheld-1] are exactly the pool's live slots */
+    for (int op = 0; op < POOL_SWEEP_OPS; op++) {
+        unsigned kind = sweep_next() % 10;
+        if ((kind < 7 || nheld == 0) && nheld < POOL_MAX_HELD) {
+            void *got = checked_alloc(p);
+            if (got == NULL) {
+                failures_seen++; /* pool unchanged (checked); keep going */
+            } else {
+                held[nheld++] = got; /* test owns the slot */
+            }
+        } else if (nheld > 0) {
+            size_t i = sweep_next() % nheld;
+            checked_free(p, held[i]);
+            held[i] = held[--nheld];
+        }
+        CHECK(pool_check(p).live == nheld);
+    }
+
+    /* invariant: held[0..nheld-1] are still live */
+    while (nheld > 0) {
+        checked_free(p, held[--nheld]);
+    }
+    CHECK(pool_check(p).live == 0);
+    pool_destroy(p); /* every slab and p freed */
+    return failures_seen;
+}
+
+static void test_pool_fault_sweep(void) {
+    long before = fault_alloc_total();
+    CHECK(pool_sweep_run() == 0); /* dry run: nothing may fail */
+    long total = fault_alloc_total() - before;
+    CHECK(total >= 3); /* pool_create plus at least two slabs */
+
+    /* invariant: runs 1..n-1 each injected exactly one failure, and every
+     * check around it passed or was reported with its n */
+    for (long n = 1; n <= total; n++) {
+        int failures_before = failures;
+        long start = fault_alloc_total();
+
+        fault_alloc_arm(n);
+        int seen = pool_sweep_run();
+        fault_alloc_disarm();
+
+        CHECK(fault_alloc_total() - start >= n); /* the n-th alloc happened */
+        CHECK(seen == 1);
+        if (failures != failures_before) {
+            fprintf(stderr, "  ^ pool fault sweep: failed with n=%ld of %ld\n",
+                    n, total);
+        }
+    }
+}
+
 int main(void) {
     test_new_node_sets_fields();
     test_new_node_copies_key();
@@ -1584,6 +1907,12 @@ int main(void) {
     test_fixup_left_deficit_case_d_red_near_nephew();
     test_delete_rec_black_leaf_no_black_sibling_case_7();
     test_fault_sweep();
+    test_pool_create_rejects_bad_sizes();
+    test_pool_create_geometry();
+    test_pool_alloc_grows_and_reuses_lifo();
+    test_pool_full_slot_writes();
+    test_pool_null_handling();
+    test_pool_fault_sweep();
 
     if (failures == 0) {
         printf("all tests passed\n");
