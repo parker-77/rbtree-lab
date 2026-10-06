@@ -1534,7 +1534,15 @@ static void test_fault_sweep(void) {
  * Every pool_alloc/pool_free below goes through checked_alloc/checked_free,
  * which assert the slot-accounting invariant before and after the call and
  * the exact counter change the call must cause. The pointer-validity checks
- * deliberately kept out of pool.c live here instead. */
+ * deliberately kept out of pool.c live here instead.
+ *
+ * Use-after-free detection: every free slot carries POOL_POISON in each byte
+ * past its free-list link. checked_free poisons a slot before returning it,
+ * checked_alloc poisons a freshly grown slab's other slots, and every slot
+ * handed back out is checked for intact poison first -- so any write through
+ * a dangling pointer while the slot sat on the free list is caught at reuse
+ * (or sooner, by free_list_ok). The sanitizers can't see these writes: the
+ * whole slab is one live malloc block. */
 
 /* Slot 0 is aligned iff the in-band header size preserves malloc's alignment. */
 static_assert(offsetof(struct slab, mem) % alignof(max_align_t) == 0,
@@ -1543,6 +1551,7 @@ static_assert(offsetof(struct slab, mem) % alignof(max_align_t) == 0,
 #define POOL_HEADER offsetof(struct slab, mem)
 #define POOL_MAX_HELD 1024u /* > 2 * per_slab for any obj_size >= 1 */
 #define POOL_SWEEP_OPS 600  /* ~70% allocs: spans at least two slabs */
+#define POOL_POISON 0xDD    /* fill for free slots, past the link */
 
 struct pool_counts {
     size_t slabs;
@@ -1597,7 +1606,54 @@ static void check_free_delta(const rb_pool_t *p, struct pool_counts b) {
           a.free_objs == b.free_objs + 1);
 }
 
-/* pool_alloc wrapped in the invariant, delta, ownership and alignment checks. */
+/* Fills every byte of obj's slot past the free-list link with POOL_POISON;
+ * the link's bytes belong to the pool and are left alone. */
+static void poison_slot(const rb_pool_t *p, void *obj) {
+    memset((unsigned char *)obj + sizeof(struct free_slot), POOL_POISON,
+           p->slot_size - sizeof(struct free_slot));
+}
+
+/* True iff every byte of obj's slot past the link still holds POOL_POISON. */
+static bool poison_intact(const rb_pool_t *p, const void *obj) {
+    const unsigned char *bytes = obj;
+    /* invariant: bytes[link..j-1] all hold POOL_POISON */
+    for (size_t j = sizeof(struct free_slot); j < p->slot_size; j++) {
+        if (bytes[j] != POOL_POISON) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Poisons every slot of the newest slab except got, which the caller is
+ * about to own: fresh free slots then look exactly like recycled ones. */
+static void poison_fresh_slab(const rb_pool_t *p, const void *got) {
+    /* invariant: slots 0..i-1 of the newest slab, other than got, are poisoned */
+    for (size_t i = 0; i < p->per_slab; i++) {
+        void *slot = &p->slabs->mem[i * p->slot_size];
+        if (slot != got) {
+            poison_slot(p, slot);
+        }
+    }
+}
+
+/* Walks the free list without trusting it: each entry must be an owned slot
+ * (checked before its link is followed) with intact poison, and the walk
+ * must end after exactly nfree entries, so a cycle or lost tail fails too. */
+static bool free_list_ok(const rb_pool_t *p) {
+    size_t count = 0;
+    /* invariant: the count entries before s were owned, poisoned slots */
+    for (const struct free_slot *s = p->free; s != NULL; s = s->next) {
+        if (count == p->nfree || !slot_owned(p, s) || !poison_intact(p, s)) {
+            return false;
+        }
+        count++;
+    }
+    return count == p->nfree;
+}
+
+/* pool_alloc wrapped in the invariant, delta, ownership, alignment and
+ * poison checks. */
 static void *checked_alloc(rb_pool_t *p) {
     struct pool_counts b = pool_check(p);
     void *got = pool_alloc(p);
@@ -1605,11 +1661,17 @@ static void *checked_alloc(rb_pool_t *p) {
     if (got != NULL) {
         CHECK(slot_owned(p, got));
         CHECK((uintptr_t)got % alignof(max_align_t) == 0);
+        if (pool_check(p).slabs > b.slabs) {
+            poison_fresh_slab(p, got); /* got itself was never freed */
+        } else {
+            CHECK(poison_intact(p, got)); /* nothing wrote to it while free */
+        }
     }
     return got; /* caller now owns the slot (if non-NULL) */
 }
 
-/* pool_free wrapped in the same checks; refuses pointers the pool doesn't own. */
+/* pool_free wrapped in the same checks; refuses pointers the pool doesn't
+ * own, and poisons the slot on its way back. */
 static void checked_free(rb_pool_t *p, void *obj) {
     bool owned = slot_owned(p, obj);
     CHECK(owned);
@@ -1617,7 +1679,8 @@ static void checked_free(rb_pool_t *p, void *obj) {
         return; /* a foreign pointer would poison the free list */
     }
     struct pool_counts b = pool_check(p);
-    pool_free(p, obj); /* slot ownership returns to the pool */
+    poison_slot(p, obj); /* still ours: mark everything past the link freed */
+    pool_free(p, obj);   /* slot ownership returns to the pool */
     check_free_delta(p, b);
 }
 
@@ -1782,6 +1845,142 @@ static void test_pool_null_handling(void) {
     pool_destroy(p); /* the slab and p freed */
 }
 
+/* A freed node's slot holds the free-list link followed by poison, so a
+ * dangling read sees 0xDD bytes instead of the node's old contents. */
+static void test_pool_poison_fills_freed_slot(void) {
+    rb_pool_t *p = pool_create(sizeof(struct rb_node));
+    CHECK(p != NULL);
+    if (p == NULL) {
+        return;
+    }
+    struct rb_node *n = checked_alloc(p); /* test owns n */
+    CHECK(n != NULL);
+    if (n == NULL) {
+        pool_destroy(p);
+        return;
+    }
+    memset(n, 0xAA, sizeof *n); /* stand-in for live node contents */
+
+    const struct free_slot *head_before = p->free;
+    checked_free(p, n); /* n now dangles; its slot is the pool's */
+
+    CHECK(poison_intact(p, n));
+    struct free_slot link;
+    memcpy(&link, n, sizeof link); /* the first bytes are the link, not poison */
+    CHECK(link.next == head_before);
+    CHECK(p->free == (const struct free_slot *)n); /* n's slot is the new head */
+
+    /* what a stale n->value read would observe: poison, not 0xAA */
+    void *stale_value;
+    void *poison_value;
+    memcpy(&stale_value, &n->value, sizeof stale_value);
+    memset(&poison_value, POOL_POISON, sizeof poison_value);
+    CHECK(memcmp(&stale_value, &poison_value, sizeof stale_value) == 0);
+
+    CHECK(free_list_ok(p));
+    pool_destroy(p); /* the slab and p freed */
+}
+
+/* Poison written at free survives untouched until the slot is handed out
+ * again, across both slabs and in any free order. */
+static void test_pool_poison_holds_until_reuse(void) {
+    rb_pool_t *p = pool_create(sizeof(struct rb_node));
+    CHECK(p != NULL);
+    if (p == NULL) {
+        return;
+    }
+    size_t n = 2 * p->per_slab;
+    CHECK(n <= POOL_MAX_HELD);
+    void *held[POOL_MAX_HELD];
+
+    /* invariant: held[0..i-1] are live and filled with non-poison bytes */
+    for (size_t i = 0; i < n; i++) {
+        held[i] = checked_alloc(p); /* test owns held[i] */
+        CHECK(held[i] != NULL);
+        if (held[i] == NULL) {
+            n = i; /* only free what was handed out */
+            break;
+        }
+        memset(held[i], 0xAA, p->slot_size);
+    }
+    /* free evens then odds, so the free list interleaves both slabs */
+    /* invariant: every even index below i has been freed */
+    for (size_t i = 0; i < n; i += 2) {
+        checked_free(p, held[i]);
+    }
+    /* invariant: every odd index below i has been freed */
+    for (size_t i = 1; i < n; i += 2) {
+        checked_free(p, held[i]);
+    }
+    CHECK(free_list_ok(p));
+
+    /* checked_alloc verifies each recycled slot's poison before handing it out */
+    /* invariant: held[0..i-1] are live again, each found with intact poison */
+    for (size_t i = 0; i < n; i++) {
+        held[i] = checked_alloc(p);
+        CHECK(held[i] != NULL);
+    }
+    CHECK(pool_check(p).slabs == 2); /* all reuse, no growth */
+    CHECK(p->free == NULL && free_list_ok(p));
+
+    /* invariant: held[i..n-1] are still live */
+    for (size_t i = 0; i < n; i++) {
+        checked_free(p, held[i]);
+    }
+    CHECK(free_list_ok(p));
+    pool_destroy(p); /* both slabs and p freed */
+}
+
+/* Deliberate writes through a dangling pointer, standing in for an rbtree
+ * use-after-free: the detectors must flag each one. Each write lands inside
+ * a live slab, which is exactly the case ASan and Valgrind cannot see. */
+static void test_pool_poison_detects_write_after_free(void) {
+    rb_pool_t *p = pool_create(sizeof(struct rb_node));
+    CHECK(p != NULL);
+    if (p == NULL) {
+        return;
+    }
+    struct rb_node *n = checked_alloc(p);    /* test owns n */
+    struct rb_node *keep = checked_alloc(p); /* test owns keep */
+    CHECK(n != NULL && keep != NULL);
+    if (n == NULL || keep == NULL) {
+        pool_free(p, n);
+        pool_free(p, keep);
+        pool_destroy(p);
+        return;
+    }
+    checked_free(p, n); /* n dangles from here on */
+    CHECK(free_list_ok(p));
+
+    /* 1. a stale write past the link (n->value) breaks the poison */
+    n->value = (void *)0x1234;
+    CHECK(!poison_intact(p, n));
+    CHECK(!free_list_ok(p));
+    poison_slot(p, n); /* repair so the pool stays usable */
+    CHECK(free_list_ok(p));
+
+    /* 2. a stale write to n->key lands on the link itself, which poison can't
+     * cover; the free-list walk catches it because the link stops pointing at
+     * an owned slot. Written as a free_slot so the walk's read of the link
+     * stays well-typed; it stands in for `n->key = (char *)0x10`. */
+    struct free_slot saved;
+    memcpy(&saved, n, sizeof saved);
+    struct free_slot bogus = {.next = (struct free_slot *)(uintptr_t)0x10};
+    memcpy(n, &bogus, sizeof bogus);
+    CHECK(!free_list_ok(p));
+    memcpy(n, &saved, sizeof saved); /* repair the link */
+    CHECK(free_list_ok(p));
+
+    /* 3. the slot is reused cleanly once repaired: checked_alloc's poison
+     * check passes and hands n's slot back (LIFO) */
+    CHECK(checked_alloc(p) == n); /* test owns n again */
+
+    checked_free(p, n);
+    checked_free(p, keep);
+    CHECK(free_list_ok(p));
+    pool_destroy(p); /* the slab and p freed */
+}
+
 /* Runs the seeded alloc/free scenario once. Returns how many calls reported
  * an allocation failure: pool_create returning NULL or pool_alloc returning
  * NULL. Every run frees everything it holds and destroys the pool, so
@@ -1814,6 +2013,7 @@ static int pool_sweep_run(void) {
             held[i] = held[--nheld];
         }
         CHECK(pool_check(p).live == nheld);
+        CHECK(free_list_ok(p)); /* every free slot owned, poisoned, counted */
     }
 
     /* invariant: held[0..nheld-1] are still live */
@@ -1912,6 +2112,9 @@ int main(void) {
     test_pool_alloc_grows_and_reuses_lifo();
     test_pool_full_slot_writes();
     test_pool_null_handling();
+    test_pool_poison_fills_freed_slot();
+    test_pool_poison_holds_until_reuse();
+    test_pool_poison_detects_write_after_free();
     test_pool_fault_sweep();
 
     if (failures == 0) {
