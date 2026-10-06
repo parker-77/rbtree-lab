@@ -1,4 +1,5 @@
 #include "rbtree.h"
+#include "pool.h"
 #include "../tests/fault_alloc.h"
 
 #include <assert.h>
@@ -20,10 +21,12 @@ struct rbtree {
     struct rb_node *root;
     rb_value_free_fn value_free; /* may be NULL: values not owned */
     size_t size;                 /* count of distinct keys */
+    rb_pool_t *pool;             /* sole source of node storage; never NULL */
 };
 
-/* Internal helpers; defined below the public API they support. */
-static struct rb_node *new_node(const char *key, void *value);
+/* Internal helpers; defined below the public API they support. Every helper
+ * that allocates or frees a node takes the tree's pool. */
+static struct rb_node *new_node(const char *key, void *value, rb_pool_t *pool);
 static int key_compare(const struct rb_node *n, const char *key);
 static bool is_red(const struct rb_node *n);
 static struct rb_node *rotate_left(struct rb_node *n);
@@ -31,38 +34,54 @@ static struct rb_node *rotate_right(struct rb_node *n);
 static struct rb_node *insert_fixup(struct rb_node *n);
 static struct rb_node *insert_rec(struct rb_node *n, const char *key,
                                    void *value, rb_value_free_fn value_free,
-                                   bool *inserted);
+                                   bool *inserted, rb_pool_t *pool);
 static struct rb_node *fixup_left_deficit(struct rb_node *n, bool *shorter);
 static struct rb_node *fixup_right_deficit(struct rb_node *n, bool *shorter);
 static struct rb_node *extract_min(struct rb_node *n, char **out_key,
-                                    void **out_value, bool *shorter);
+                                    void **out_value, bool *shorter,
+                                    rb_pool_t *pool);
 static struct rb_node *delete_rec(struct rb_node *n, const char *key,
                                    rb_value_free_fn value_free, bool *deleted,
-                                   bool *shorter);
+                                   bool *shorter, rb_pool_t *pool);
 static void foreach_rec(const struct rb_node *n,
                          void (*fn)(const char *key, void *value, void *ctx),
                          void *ctx);
-static void destroy_rec(struct rb_node *n, rb_value_free_fn value_free);
+static void destroy_rec(struct rb_node *n, rb_value_free_fn value_free,
+                         rb_pool_t *pool);
 static int validate_rec(const struct rb_node *n, const char **prev_key,
                          size_t *count, int *error);
 
-/* Allocates an empty tree. Returns NULL on allocation failure. */
+/* Every tree is pooled: node storage always comes from the tree's pool. */
 rbtree_t *rb_create(rb_value_free_fn value_free) {
+    return rb_create_pooled(value_free);
+}
+
+/* Allocates an empty tree and the slab pool its node structs come from.
+ * Returns NULL on allocation failure (nothing allocated survives it). */
+rbtree_t *rb_create_pooled(rb_value_free_fn value_free) {
     struct rbtree *t = rb_malloc(sizeof *t);
     if (t == NULL) {
         return NULL;
     }
 
+    t->pool = pool_create(sizeof(struct rb_node)); /* tree takes ownership of the pool */
+    if (t->pool == NULL) {
+        goto cleanup_tree;
+    }
     t->root = NULL;
     t->value_free = value_free;
     t->size = 0;
     return t;
+
+cleanup_tree:
+    rb_free(t);
+    return NULL;
 }
 
 int rb_insert(struct rbtree *t, const char *key, void *value) {
     bool inserted = false;
     struct rb_node *new_root =
-        insert_rec(t->root, key, value, t->value_free, &inserted);
+        insert_rec(t->root, key, value, t->value_free, &inserted, t->pool);
     if (new_root == NULL) {
         return -1; /* allocation failure; t unchanged */
     }
@@ -95,7 +114,7 @@ int rb_delete(rbtree_t *t, const char *key) {
     bool deleted = false;
     bool shorter = false;
     struct rb_node *new_root =
-        delete_rec(t->root, key, t->value_free, &deleted, &shorter);
+        delete_rec(t->root, key, t->value_free, &deleted, &shorter, t->pool);
     if (!deleted) {
         return -1; /* key absent; t left untouched */
     }
@@ -139,24 +158,28 @@ void rb_destroy(rbtree_t *t) {
     if (t == NULL) {
         return;
     }
-    destroy_rec(t->root, t->value_free);
+    destroy_rec(t->root, t->value_free, t->pool);
+    pool_destroy(t->pool); /* every slab and the pool itself freed */
     rb_free(t);
 }
 
-/* Allocates a new red leaf node, copying key. Returns NULL on allocation
- * failure (nothing allocated survives such a failure). */
-static struct rb_node *new_node(const char *key, void *value) {
-    struct rb_node *n = rb_malloc(sizeof *n);
-    if (n == NULL) {
-        return NULL;
-    }
-
+/* Allocates a new red leaf node from pool, copying key. Returns NULL on
+ * allocation failure (nothing allocated survives such a failure). The key
+ * copy is taken first: pool_alloc may grow the pool, which a later failure
+ * couldn't undo, so it goes last and a failed insert leaves the pool's
+ * counters untouched. */
+static struct rb_node *new_node(const char *key, void *value, rb_pool_t *pool) {
     size_t key_len = strlen(key) + 1;
     char *key_copy = rb_malloc(key_len);
     if (key_copy == NULL) {
-        goto cleanup_node;
+        return NULL;
     }
     memcpy(key_copy, key, key_len);
+
+    struct rb_node *n = pool_alloc(pool); /* caller takes ownership of the slot */
+    if (n == NULL) {
+        goto cleanup_key;
+    }
 
     n->key = key_copy; /* node takes ownership of the key copy */
     n->value = value;  /* node takes ownership of value per the header contract */
@@ -165,8 +188,8 @@ static struct rb_node *new_node(const char *key, void *value) {
     n->color = RED;
     return n;
 
-cleanup_node:
-    rb_free(n);
+cleanup_key:
+    rb_free(key_copy);
     return NULL;
 }
 
@@ -265,9 +288,9 @@ static struct rb_node *insert_fixup(struct rb_node *n) {
  * count without re-walking the tree. */
 static struct rb_node *insert_rec(struct rb_node *n, const char *key,
                                    void *value, rb_value_free_fn value_free,
-                                   bool *inserted) {
+                                   bool *inserted, rb_pool_t *pool) {
     if (n == NULL) {
-        struct rb_node *new_n = new_node(key, value);
+        struct rb_node *new_n = new_node(key, value, pool);
         if (new_n != NULL) {
             *inserted = true;
         }
@@ -277,14 +300,14 @@ static struct rb_node *insert_rec(struct rb_node *n, const char *key,
     int cmp = key_compare(n, key);
     if (cmp < 0) {
         struct rb_node *new_left =
-            insert_rec(n->left, key, value, value_free, inserted);
+            insert_rec(n->left, key, value, value_free, inserted, pool);
         if (new_left == NULL) {
             return NULL; /* allocation failure; n and every ancestor untouched */
         }
         n->left = new_left;
     } else if (cmp > 0) {
         struct rb_node *new_right =
-            insert_rec(n->right, key, value, value_free, inserted);
+            insert_rec(n->right, key, value, value_free, inserted, pool);
         if (new_right == NULL) {
             return NULL; /* allocation failure; n and every ancestor untouched */
         }
@@ -436,13 +459,14 @@ static struct rb_node *fixup_left_deficit(struct rb_node *n, bool *shorter) {
  * is responsible for freeing or reinstalling them. *shorter reports whether
  * this subtree's black-height dropped by one. */
 static struct rb_node *extract_min(struct rb_node *n, char **out_key,
-                                    void **out_value, bool *shorter) {
+                                    void **out_value, bool *shorter,
+                                    rb_pool_t *pool) {
     if (n->left == NULL) {
         *out_key = n->key;     /* ownership transferred to caller */
         *out_value = n->value; /* ownership transferred to caller */
         struct rb_node *right = n->right;
         bool was_black = (n->color == BLACK);
-        rb_free(n); /* node struct freed; key/value ownership already moved out */
+        pool_free(pool, n); /* node struct freed; key/value ownership already moved out */
 
         if (right != NULL) {
             right->color = BLACK; /* case 6: red child absorbs the black n had */
@@ -453,7 +477,8 @@ static struct rb_node *extract_min(struct rb_node *n, char **out_key,
         return right;
     }
 
-    struct rb_node *new_left = extract_min(n->left, out_key, out_value, shorter);
+    struct rb_node *new_left =
+        extract_min(n->left, out_key, out_value, shorter, pool);
     n->left = new_left;
     if (*shorter) {
         n = fixup_left_deficit(n, shorter);
@@ -469,7 +494,7 @@ static struct rb_node *extract_min(struct rb_node *n, char **out_key,
  * occupied this slot before the call. */
 static struct rb_node *delete_rec(struct rb_node *n, const char *key,
                                    rb_value_free_fn value_free, bool *deleted,
-                                   bool *shorter) {
+                                   bool *shorter, rb_pool_t *pool) {
     if (n == NULL) {
         *shorter = false; /* key absent in this subtree; nothing to change */
         return NULL;
@@ -478,7 +503,7 @@ static struct rb_node *delete_rec(struct rb_node *n, const char *key,
     int cmp = key_compare(n, key);
     if (cmp < 0) {
         struct rb_node *new_left =
-            delete_rec(n->left, key, value_free, deleted, shorter);
+            delete_rec(n->left, key, value_free, deleted, shorter, pool);
         n->left = new_left;
         if (*shorter) {
             n = fixup_left_deficit(n, shorter);
@@ -487,7 +512,7 @@ static struct rb_node *delete_rec(struct rb_node *n, const char *key,
     }
     if (cmp > 0) {
         struct rb_node *new_right =
-            delete_rec(n->right, key, value_free, deleted, shorter);
+            delete_rec(n->right, key, value_free, deleted, shorter, pool);
         n->right = new_right;
         if (*shorter) {
             n = fixup_right_deficit(n, shorter);
@@ -507,7 +532,7 @@ static struct rb_node *delete_rec(struct rb_node *n, const char *key,
         void *succ_value;
         bool succ_shorter = false;
         struct rb_node *new_right =
-            extract_min(n->right, &succ_key, &succ_value, &succ_shorter);
+            extract_min(n->right, &succ_key, &succ_value, &succ_shorter, pool);
 
         if (value_free != NULL) {
             value_free(n->value); /* release n's old value */
@@ -530,7 +555,7 @@ static struct rb_node *delete_rec(struct rb_node *n, const char *key,
             value_free(n->value);
         }
         rb_free(n->key);
-        rb_free(n); /* leaf's node struct freed; no children to preserve */
+        pool_free(pool, n); /* leaf's node struct freed; no children to preserve */
         *shorter = was_black;
         return NULL;
     }
@@ -542,7 +567,7 @@ static struct rb_node *delete_rec(struct rb_node *n, const char *key,
         value_free(n->value);
     }
     rb_free(n->key);
-    rb_free(n); /* n's node struct freed; child subtree reattached in its place */
+    pool_free(pool, n); /* n's node struct freed; child subtree reattached in its place */
     child->color = BLACK;
     *shorter = false;
     return child;
@@ -566,17 +591,18 @@ static void foreach_rec(const struct rb_node *n,
  * of this frame — both children have to already be fully recursed into
  * (their pointers read) before that happens, or the second recursive call
  * would read n->right off an already-freed n. */
-static void destroy_rec(struct rb_node *n, rb_value_free_fn value_free) {
+static void destroy_rec(struct rb_node *n, rb_value_free_fn value_free,
+                         rb_pool_t *pool) {
     if (n == NULL) {
         return;
     }
-    destroy_rec(n->left, value_free);
-    destroy_rec(n->right, value_free);
+    destroy_rec(n->left, value_free, pool);
+    destroy_rec(n->right, value_free, pool);
     if (value_free != NULL) {
         value_free(n->value); /* tree relinquishes ownership of value */
     }
     rb_free(n->key);
-    rb_free(n); /* tree relinquishes ownership of the node itself */
+    pool_free(pool, n); /* tree relinquishes ownership of the node itself */
 }
 
 /* Returns this subtree's black-height (>= 0), or -1 if a violation was found

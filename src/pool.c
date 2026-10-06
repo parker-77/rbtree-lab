@@ -1,5 +1,6 @@
 #include <stddef.h>
 
+#include "pool.h" /* compiler checks the declarations below against it */
 #include "../tests/fault_alloc.h"
 
 typedef struct rb_pool rb_pool_t;
