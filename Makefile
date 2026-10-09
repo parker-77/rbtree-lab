@@ -30,7 +30,7 @@ all: $(BIN) $(FUZZBIN)
 # define every symbol twice.
 $(BIN): $(SRC) src/pool.c src/pool.h $(TSRC) $(FAULT) tests/fault_alloc.h include/rbtree.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) $(TSRC) $(FAULT) -o $@
+	$(CC) $(CFLAGS) -pthread $(TSRC) $(FAULT) -o $@
 
 $(FUZZBIN): $(SRC) src/pool.c src/pool.h tests/fuzz.c $(FAULT) tests/fault_alloc.h include/rbtree.h
 	@mkdir -p build

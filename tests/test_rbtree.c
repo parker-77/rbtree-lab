@@ -10,6 +10,10 @@
  * counters, and rb_destroy must have returned every slot before the pool goes.
  * pool.h is included first so its prototypes are seen unrenamed; the macros
  * are dropped before pool.c, whose definitions must keep their real names. */
+/* -std=c23 hides POSIX from glibc headers; the small-stack tests need mmap,
+ * MAP_ANONYMOUS, pthread_attr_setstack and sysconf. Must precede every
+ * system header, including the ones src/rbtree.c pulls in. */
+#define _DEFAULT_SOURCE
 #include "../src/pool.h"
 static void *checked_alloc(rb_pool_t *p);
 static void checked_free(rb_pool_t *p, void *obj);
@@ -25,8 +29,11 @@ static void checked_destroy(rb_pool_t *p);
  * tests can read per_slab and walk slabs directly. */
 #include "../src/pool.c"
 
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 static int failures = 0;
 
@@ -46,6 +53,13 @@ static bool free_list_ok(const rb_pool_t *p);
 /* Node-level tests build nodes outside any tree, so they draw node slots
  * from this pool (created in main) the way a tree's helpers use t->pool. */
 static rb_pool_t *test_pool;
+
+/* When false, checked_alloc/checked_free skip straight to the pool and
+ * checked_destroy keeps only its O(1) leak check: the per-call checks scan
+ * every slab, far too slow for the million-node small-stack tests. Only
+ * flip it for a tree's whole life (create through destroy): a slot freed
+ * unchecked is never poisoned, so a checked alloc would then misreport it. */
+static bool pool_checks = true;
 
 #define CHECK(cond)                                                    \
     do {                                                               \
@@ -1699,6 +1713,9 @@ static bool free_list_ok(const rb_pool_t *p) {
 /* pool_alloc wrapped in the invariant, delta, ownership, alignment and
  * poison checks. */
 static void *checked_alloc(rb_pool_t *p) {
+    if (!pool_checks) {
+        return pool_alloc(p); /* caller now owns the slot (if non-NULL) */
+    }
     struct pool_counts b = pool_check(p);
     void *got = pool_alloc(p);
     check_alloc_delta(p, b, got != NULL);
@@ -1717,6 +1734,10 @@ static void *checked_alloc(rb_pool_t *p) {
 /* pool_free wrapped in the same checks; refuses pointers the pool doesn't
  * own, and poisons the slot on its way back. */
 static void checked_free(rb_pool_t *p, void *obj) {
+    if (!pool_checks) {
+        pool_free(p, obj); /* slot ownership returns to the pool */
+        return;
+    }
     bool owned = slot_owned(p, obj);
     CHECK(owned);
     if (!owned) {
@@ -1735,7 +1756,7 @@ static void checked_free(rb_pool_t *p, void *obj) {
 static void checked_destroy(rb_pool_t *p) {
     if (p != NULL) {
         CHECK(pool_check(p).live == 0);
-        CHECK(free_list_ok(p));
+        CHECK(!pool_checks || free_list_ok(p)); /* unchecked frees left no poison */
     }
     pool_destroy(p); /* every slab and p freed */
 }
@@ -2166,6 +2187,278 @@ static void test_rb_pool_live_tracks_size(void) {
     CHECK(free_call_count == frees_before + (int)n);
 }
 
+/* --- Bounded stack (M3) --------------------------------------------------
+ * rb_foreach and rb_destroy promise O(1) auxiliary space with no recursion.
+ * Each runs here on a thread that can touch at most 64 KiB of stack, over
+ * 2^20-node trees: one built by rb_insert (balanced, ~40 deep, so this one
+ * checks scale rather than depth), and one left-only chain built by hand
+ * (2^20 deep: a recursive walk would need tens of MiB of stack). */
+
+#define SMALL_STACK_BYTES ((size_t)64 * 1024) /* a multiple of 4 and 16 KiB pages */
+#define BIG_N ((size_t)1 << 20)
+#define BIG_KEY_LEN 8 /* "%07zu" of at most BIG_N - 1, plus NUL */
+
+/* Runs fn(arg) on a pthread that can touch at most SMALL_STACK_BYTES of
+ * stack. glibc refuses stacks under _SC_THREAD_STACK_MIN (128 KiB on
+ * aarch64), so the thread gets a region of at least that size whose low end
+ * is PROT_NONE: the stack grows down from the top, and any access past the
+ * top SMALL_STACK_BYTES faults. glibc also keeps the thread descriptor and
+ * static TLS at the top of a caller-supplied stack, so the usable budget is
+ * a little under SMALL_STACK_BYTES, never over. Returns false iff fn never
+ * ran (the region or thread couldn't be set up). */
+static bool run_on_small_stack(void *(*fn)(void *), void *arg) {
+    long page_l = sysconf(_SC_PAGESIZE);
+    long min_l = sysconf(_SC_THREAD_STACK_MIN);
+    if (page_l <= 0) {
+        return false;
+    }
+    size_t page = (size_t)page_l;
+    size_t region = SMALL_STACK_BYTES + page; /* at least one guard page */
+    if (min_l > 0 && (size_t)min_l > region) {
+        region = (size_t)min_l;
+    }
+    region = (region + page - 1) / page * page;
+
+    unsigned char *base = mmap(NULL, region, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) {
+        return false;
+    }
+    bool ran = false;
+    pthread_attr_t attr;
+    pthread_t tid;
+    if (mprotect(base, region - SMALL_STACK_BYTES, PROT_NONE) != 0) {
+        goto cleanup_map;
+    }
+    if (pthread_attr_init(&attr) != 0) {
+        goto cleanup_map;
+    }
+    if (pthread_attr_setstack(&attr, base, region) == 0 &&
+        pthread_create(&tid, &attr, fn, arg) == 0) {
+        ran = true;
+        CHECK(pthread_join(tid, NULL) == 0);
+    }
+    pthread_attr_destroy(&attr);
+cleanup_map:
+    munmap(base, region); /* guard and stack pages released together */
+    return ran;
+}
+
+static size_t big_frees = 0;
+
+/* value_free for the big trees, whose values are malloc'd size_t indices. */
+static void big_value_free(void *value) {
+    free(value); /* the index the test malloc'd is freed */
+    big_frees++;
+}
+
+/* Zero-padded so strcmp order matches numeric order. */
+static void big_key(size_t i, char key[BIG_KEY_LEN]) {
+    snprintf(key, BIG_KEY_LEN, "%07zu", i);
+}
+
+struct big_walk {
+    rbtree_t *t;
+    size_t visited;
+    size_t mismatches; /* visits whose key or value wasn't the expected one */
+};
+
+/* rb_foreach callback: keys 0..n-1 are all present, so the i-th visit must
+ * be key i holding value i. Reads only its arguments, never the tree. */
+static void big_visit(const char *key, void *value, void *ctx) {
+    struct big_walk *w = ctx;
+    char expected[BIG_KEY_LEN];
+    big_key(w->visited, expected);
+    if (strcmp(key, expected) != 0 || *(const size_t *)value != w->visited) {
+        w->mismatches++;
+    }
+    w->visited++;
+}
+
+static void *big_foreach_thread(void *arg) {
+    struct big_walk *w = arg;
+    rb_foreach(w->t, big_visit, w);
+    return NULL;
+}
+
+static void *big_destroy_thread(void *arg) {
+    rb_destroy(arg); /* tree relinquishes every node, key copy and value */
+    return NULL;
+}
+
+/* One node's links and color, recorded before rb_foreach threads the tree. */
+struct node_shape {
+    const struct rb_node *node;
+    const struct rb_node *left;
+    const struct rb_node *right;
+    rb_color_t color;
+};
+
+/* Records every node's shape, pre-order, with a heap stack (test code, so
+ * no space bound; and no recursion, since the chain is 2^20 deep). Returns
+ * NULL on allocation failure; the caller owns the returned array. */
+static struct node_shape *shape_snapshot(const rbtree_t *t) {
+    size_t n = rb_size(t);
+    struct node_shape *shapes = malloc((n > 0 ? n : 1) * sizeof *shapes);
+    const struct rb_node **stack = malloc((n > 0 ? n : 1) * sizeof *stack);
+    if (shapes == NULL || stack == NULL) {
+        free(shapes);
+        free(stack);
+        return NULL;
+    }
+    size_t top = 0;
+    size_t out = 0;
+    if (t->root != NULL) {
+        stack[top++] = t->root;
+    }
+    /* invariant: shapes[0..out-1] are recorded and stack[0..top-1] holds the
+     * roots of the unrecorded subtrees; each node is pushed once, so
+     * out + top <= n in a well-formed tree */
+    while (top > 0 && out < n) {
+        const struct rb_node *x = stack[--top];
+        shapes[out++] = (struct node_shape){x, x->left, x->right, x->color};
+        if (x->right != NULL && top < n) {
+            stack[top++] = x->right;
+        }
+        if (x->left != NULL && top < n) {
+            stack[top++] = x->left;
+        }
+    }
+    free(stack);
+    CHECK(out == n && top == 0); /* exactly rb_size nodes reachable */
+    return shapes;
+}
+
+/* rb_foreach on a 64 KiB stack visits every key in order and leaves every
+ * node's links and color exactly as it found them. Compares against the
+ * snapshot instead of walking the tree, so a leftover thread (a cycle)
+ * fails a CHECK rather than hanging the run. */
+static void check_big_foreach(rbtree_t *t) {
+    struct node_shape *before = shape_snapshot(t);
+    CHECK(before != NULL);
+    if (before == NULL) {
+        return;
+    }
+    struct big_walk w = {.t = t};
+    CHECK(run_on_small_stack(big_foreach_thread, &w));
+    CHECK(w.visited == rb_size(t) && w.mismatches == 0);
+
+    size_t changed = 0;
+    /* invariant: changed counts the nodes in before[0..i-1] whose links or
+     * color differ from what was recorded */
+    for (size_t i = 0; i < rb_size(t); i++) {
+        const struct rb_node *x = before[i].node;
+        if (x->left != before[i].left || x->right != before[i].right ||
+            x->color != before[i].color) {
+            changed++;
+        }
+    }
+    CHECK(changed == 0);
+    free(before); /* the snapshot array, owned here */
+}
+
+/* rb_destroy on a 64 KiB stack frees every value exactly once; the pool's
+ * leak check in checked_destroy and Valgrind/ASan cover nodes and keys. If
+ * the small-stack thread can't start, t is destroyed here instead so the
+ * run stays leak-free. */
+static void check_big_destroy(rbtree_t *t) {
+    size_t n = rb_size(t);
+    big_frees = 0;
+    bool ran = run_on_small_stack(big_destroy_thread, t);
+    CHECK(ran);
+    if (!ran) {
+        rb_destroy(t); /* tree relinquishes everything, on the main stack */
+    }
+    CHECK(big_frees == n);
+}
+
+/* 2^20 keys inserted in a scrambled order, each owning a malloc'd index. */
+static void test_morris_balanced_tree_on_small_stack(void) {
+    pool_checks = false; /* this tree's whole life runs unchecked; see pool_checks */
+    rbtree_t *t = rb_create(big_value_free);
+    CHECK(t != NULL);
+    if (t == NULL) {
+        pool_checks = true;
+        return;
+    }
+
+    bool built = true;
+    char key[BIG_KEY_LEN];
+    /* invariant: the first i keys of the permutation are in t, each owning
+     * a malloc'd copy of its index */
+    for (size_t i = 0; i < BIG_N; i++) {
+        size_t k = (i * (size_t)2654435761u) % BIG_N; /* odd multiplier: a permutation of 0..BIG_N-1 */
+        size_t *v = malloc(sizeof *v);
+        if (v == NULL) {
+            built = false;
+            break;
+        }
+        *v = k;
+        big_key(k, key);
+        if (rb_insert(t, key, v) != 0) {
+            free(v); /* v not consumed on failure; still ours */
+            built = false;
+            break;
+        }
+    }
+    CHECK(built);
+    if (built) {
+        CHECK(rb_size(t) == BIG_N && rb_validate(t) == 0);
+        check_big_foreach(t);
+        CHECK(rb_validate(t) == 0); /* still a valid red-black tree */
+        check_big_destroy(t);
+    } else {
+        rb_destroy(t); /* tree relinquishes the partial build */
+    }
+    pool_checks = true;
+}
+
+/* 2^20 nodes linked by hand into a left-only chain, largest key at the
+ * root: not a valid red-black tree, but a valid BST, and the deepest shape
+ * possible. Morris threads every node of it (each node's predecessor is its
+ * left child). */
+static void test_morris_left_chain_on_small_stack(void) {
+    pool_checks = false; /* this tree's whole life runs unchecked; see pool_checks */
+    rbtree_t *t = rb_create(big_value_free);
+    CHECK(t != NULL);
+    if (t == NULL) {
+        pool_checks = true;
+        return;
+    }
+
+    bool built = true;
+    char key[BIG_KEY_LEN];
+    /* invariant: t->root is a left-only chain of keys 0..i-1, largest at the
+     * root, and t->size == i */
+    for (size_t i = 0; i < BIG_N; i++) {
+        size_t *v = malloc(sizeof *v);
+        if (v == NULL) {
+            built = false;
+            break;
+        }
+        *v = i;
+        big_key(i, key);
+        struct rb_node *n = new_node(key, v, t->pool);
+        if (n == NULL) {
+            free(v); /* new_node frees its own partial work; v is still ours */
+            built = false;
+            break;
+        }
+        n->color = BLACK;
+        n->left = t->root; /* n takes ownership of the chain built so far */
+        t->root = n;       /* tree takes ownership of n (and its value) */
+        t->size++;
+    }
+    CHECK(built);
+    if (built) {
+        check_big_foreach(t);
+        check_big_destroy(t);
+    } else {
+        rb_destroy(t); /* tree relinquishes the partial chain */
+    }
+    pool_checks = true;
+}
+
 int main(void) {
     test_pool = pool_create(sizeof(struct rb_node)); /* main owns test_pool */
     if (test_pool == NULL) {
@@ -2239,6 +2532,8 @@ int main(void) {
     test_pool_poison_detects_write_after_free();
     test_pool_fault_sweep();
     test_rb_pool_live_tracks_size();
+    test_morris_balanced_tree_on_small_stack();
+    test_morris_left_chain_on_small_stack();
 
     /* every node a node-level test built went back, and no free slot was
      * written after its free */
