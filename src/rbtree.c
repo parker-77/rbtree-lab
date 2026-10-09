@@ -24,6 +24,18 @@ struct rbtree {
     rb_pool_t *pool;             /* sole source of node storage; never NULL */
 };
 
+/* Visitor contexts for morris_inorder: foreach_ctx adapts rb_foreach's
+ * key/value callback; destroy_ctx carries what destroy_visit needs to free. */
+struct foreach_ctx {
+    void (*fn)(const char *key, void *value, void *ctx);
+    void *ctx;
+};
+
+struct destroy_ctx {
+    rb_value_free_fn value_free;
+    rb_pool_t *pool;
+};
+
 /* Internal helpers; defined below the public API they support. Every helper
  * that allocates or frees a node takes the tree's pool. */
 static struct rb_node *new_node(const char *key, void *value, rb_pool_t *pool);
@@ -43,11 +55,11 @@ static struct rb_node *extract_min(struct rb_node *n, char **out_key,
 static struct rb_node *delete_rec(struct rb_node *n, const char *key,
                                    rb_value_free_fn value_free, bool *deleted,
                                    bool *shorter, rb_pool_t *pool);
-static void foreach_rec(const struct rb_node *n,
-                         void (*fn)(const char *key, void *value, void *ctx),
-                         void *ctx);
-static void destroy_rec(struct rb_node *n, rb_value_free_fn value_free,
-                         rb_pool_t *pool);
+static void morris_inorder(struct rb_node *root, bool destructive,
+                           void (*visit)(struct rb_node *n, void *ctx),
+                           void *ctx);
+static void foreach_visit(struct rb_node *n, void *ctx);
+static void destroy_visit(struct rb_node *n, void *ctx);
 static int validate_rec(const struct rb_node *n, const char **prev_key,
                          size_t *count, int *error);
 
@@ -134,7 +146,10 @@ size_t rb_size(const rbtree_t *t) {
 void rb_foreach(const rbtree_t *t,
                 void (*fn)(const char *key, void *value, void *ctx),
                 void *ctx) {
-    foreach_rec(t->root, fn, ctx);
+    /* t is const, but t->root is a plain struct rb_node *: the threads are
+     * written through node pointers and all removed before this returns. */
+    struct foreach_ctx fc = {.fn = fn, .ctx = ctx};
+    morris_inorder(t->root, false, foreach_visit, &fc);
 }
 
 int rb_validate(const rbtree_t *t) {
@@ -158,7 +173,8 @@ void rb_destroy(rbtree_t *t) {
     if (t == NULL) {
         return;
     }
-    destroy_rec(t->root, t->value_free, t->pool);
+    struct destroy_ctx dc = {.value_free = t->value_free, .pool = t->pool};
+    morris_inorder(t->root, true, destroy_visit, &dc); /* tree relinquishes every node */
     pool_destroy(t->pool); /* every slab and the pool itself freed */
     rb_free(t);
 }
@@ -573,36 +589,76 @@ static struct rb_node *delete_rec(struct rb_node *n, const char *key,
     return child;
 }
 
-/* In-order recursion: left subtree, then n itself, then right subtree —
- * visits keys in ascending strcmp order. */
-static void foreach_rec(const struct rb_node *n,
-                         void (*fn)(const char *key, void *value, void *ctx),
-                         void *ctx) {
-    if (n == NULL) {
-        return;
+/* Morris in-order traversal: O(1) auxiliary space, no recursion. Calls
+ * visit(n, ctx) on every node in ascending strcmp order.
+ *
+ * Instead of a stack, it borrows the NULL right pointer of each node's
+ * in-order predecessor (the rightmost node of its left subtree) as a
+ * temporary "thread" back up to that node. A node with a left child is
+ * reached twice: on the first arrival the thread is set and the walk goes
+ * left; on the second (via the thread) the left subtree is known finished.
+ *
+ * Non-destructive: the second arrival removes the thread before visiting,
+ * so every pointer is back to its original value when this returns. While
+ * it runs the tree contains cycles, so visit must not search or modify it.
+ *
+ * Destructive: the first arrival also cuts cur->left, so a node is only
+ * ever visited from the no-left-child branch and the second-arrival walk
+ * (which would read the already-freed left subtree) never happens. visit
+ * may free n: n->right is always read before visit is called. */
+static void morris_inorder(struct rb_node *root, bool destructive,
+                           void (*visit)(struct rb_node *n, void *ctx),
+                           void *ctx) {
+    struct rb_node *cur = root;
+    /* invariant: every thread still set points from some node to an
+     * ancestor of cur whose left subtree is not yet finished; all other
+     * right pointers hold their original values */
+    while (cur != NULL) {
+        if (cur->left == NULL) {
+            struct rb_node *next = cur->right; /* child or thread; read before visit may free cur */
+            visit(cur, ctx);
+            cur = next;
+            continue;
+        }
+
+        struct rb_node *pred = cur->left;
+        /* invariant: pred lies on cur->left's right spine, before any thread */
+        while (pred->right != NULL && pred->right != cur) {
+            pred = pred->right;
+        }
+
+        if (pred->right == NULL) {
+            pred->right = cur; /* first arrival: thread pred -> cur */
+            struct rb_node *left = cur->left;
+            if (destructive) {
+                cur->left = NULL; /* cur no longer owns its left subtree; the walk below does */
+            }
+            cur = left;
+        } else {
+            pred->right = NULL; /* second arrival: thread removed, pred restored */
+            struct rb_node *next = cur->right;
+            visit(cur, ctx);
+            cur = next;
+        }
     }
-    foreach_rec(n->left, fn, ctx);
-    fn(n->key, n->value, ctx);
-    foreach_rec(n->right, fn, ctx);
 }
 
-/* Post-order recursion: left subtree, right subtree, then n itself. Must be
- * post-order (not in-order, like foreach_rec) because n is freed at the end
- * of this frame — both children have to already be fully recursed into
- * (their pointers read) before that happens, or the second recursive call
- * would read n->right off an already-freed n. */
-static void destroy_rec(struct rb_node *n, rb_value_free_fn value_free,
-                         rb_pool_t *pool) {
-    if (n == NULL) {
-        return;
-    }
-    destroy_rec(n->left, value_free, pool);
-    destroy_rec(n->right, value_free, pool);
-    if (value_free != NULL) {
-        value_free(n->value); /* tree relinquishes ownership of value */
+static void foreach_visit(struct rb_node *n, void *ctx) {
+    struct foreach_ctx *fc = ctx;
+    fc->fn(n->key, n->value, fc->ctx);
+}
+
+/* Frees one node during a destructive morris_inorder. By the time n is
+ * visited nothing still reachable points to it: its parent either cut the
+ * link (left child) or was freed already (right child), and the thread into
+ * it lived in a predecessor that was freed already. */
+static void destroy_visit(struct rb_node *n, void *ctx) {
+    struct destroy_ctx *dc = ctx;
+    if (dc->value_free != NULL) {
+        dc->value_free(n->value); /* tree relinquishes ownership of value */
     }
     rb_free(n->key);
-    pool_free(pool, n); /* tree relinquishes ownership of the node itself */
+    pool_free(dc->pool, n); /* tree relinquishes ownership of the node itself */
 }
 
 /* Returns this subtree's black-height (>= 0), or -1 if a violation was found
