@@ -30,10 +30,7 @@ size_t rb_size(const rbtree_t *t);
 
 /* In-order. Mutation 3: O(1) auxiliary space, no recursion. */
 void rb_foreach(const rbtree_t *t,
-
-void (*fn)(const char *key, void *value, void *ctx),
-
-void *ctx);
+                void (*fn)(const char *key, void *value, void *ctx), void *ctx);
 
 /* Returns 0 iff all red-black invariants hold
  * (see the baseline section). */

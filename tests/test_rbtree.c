@@ -8,13 +8,14 @@
  * tree frees is poisoned, every slot it reuses is checked for intact poison
  * (use-after-free writes), every alloc/free is checked against the pool's
  * counters, and rb_destroy must have returned every slot before the pool goes.
- * pool.h is included first so its prototypes are seen unrenamed; the macros
- * are dropped before pool.c, whose definitions must keep their real names. */
+ * rb_pool_t is declared here because the checked_* prototypes need it before
+ * rbtree.c is pulled in; the macros are dropped before pool.c, whose
+ * definitions must keep their real names. */
 /* -std=c23 hides POSIX from glibc headers; the small-stack tests need mmap,
  * MAP_ANONYMOUS, pthread_attr_setstack and sysconf. Must precede every
  * system header, including the ones src/rbtree.c pulls in. */
 #define _DEFAULT_SOURCE
-#include "../src/pool.h"
+typedef struct rb_pool rb_pool_t;
 static void *checked_alloc(rb_pool_t *p);
 static void checked_free(rb_pool_t *p, void *obj);
 static void checked_destroy(rb_pool_t *p);
@@ -470,6 +471,56 @@ static void test_rb_insert_overwrite_frees_old_value(void) {
         CHECK(strcmp(t->root->key, "key") == 0);
     }
     rb_destroy(t);
+}
+
+/* Re-inserting the pointer a key already holds must not free it: the node
+ * keeps owning the same value, so it is released once, by rb_destroy. */
+static void test_rb_insert_same_value_twice_frees_nothing(void) {
+    rbtree_t *t = rb_create(counting_value_free);
+    CHECK(t != NULL);
+    if (t == NULL) {
+        return;
+    }
+    free_call_count = 0;
+
+    CHECK(rb_insert(t, "key", (void *)0x1) == 0);
+    CHECK(rb_insert(t, "key", (void *)0x1) == 0);
+    CHECK(free_call_count == 0); /* same pointer: nothing was replaced */
+    CHECK(rb_find(t, "key") == (void *)0x1);
+    CHECK(rb_size(t) == 1);
+    CHECK(rb_validate(t) == 0);
+
+    rb_destroy(t);
+    CHECK(free_call_count == 1); /* released exactly once, at destroy */
+}
+
+/* Same as above with a real heap value, so a free-then-store bug shows up
+ * as a use-after-free / double free under ASan and Valgrind. */
+static void test_rb_insert_same_malloced_value_twice(void) {
+    rbtree_t *t = rb_create(free);
+    CHECK(t != NULL);
+    if (t == NULL) {
+        return;
+    }
+    int *v = malloc(sizeof *v);
+    CHECK(v != NULL);
+    if (v == NULL) {
+        rb_destroy(t);
+        return;
+    }
+    *v = 42;
+
+    CHECK(rb_insert(t, "key", v) == 0); /* tree takes ownership of v */
+    if (rb_insert(t, "key", v) != 0) {
+        CHECK(false); /* no allocation on overwrite, so this can't fail */
+    }
+    int *found = rb_find(t, "key");
+    CHECK(found == v);
+    if (found != NULL) {
+        CHECK(*found == 42); /* still live: reading it is not a use-after-free */
+    }
+
+    rb_destroy(t); /* frees v exactly once */
 }
 
 /* --- rb_size ------------------------------------------------------------- */
@@ -2483,6 +2534,8 @@ int main(void) {
     test_rb_create_sets_fields();
     test_rb_create_stores_value_free();
     test_rb_insert_overwrite_frees_old_value();
+    test_rb_insert_same_value_twice_frees_nothing();
+    test_rb_insert_same_malloced_value_twice();
     test_rb_size_tracks_distinct_keys();
     test_rb_find_returns_value_for_present_key();
     test_rb_find_returns_null_for_absent_key();

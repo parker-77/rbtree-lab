@@ -28,11 +28,11 @@ all: $(BIN) $(FUZZBIN)
 # tests/test_rbtree.c #includes src/rbtree.c and src/pool.c (unity build), so
 # both are prerequisites but must NOT be handed to the compiler -- that would
 # define every symbol twice.
-$(BIN): $(SRC) src/pool.c src/pool.h $(TSRC) $(FAULT) tests/fault_alloc.h include/rbtree.h
+$(BIN): $(SRC) src/pool.c $(TSRC) $(FAULT) tests/fault_alloc.h include/rbtree.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -pthread $(TSRC) $(FAULT) -o $@
 
-$(FUZZBIN): $(SRC) src/pool.c src/pool.h tests/fuzz.c $(FAULT) tests/fault_alloc.h include/rbtree.h
+$(FUZZBIN): $(SRC) src/pool.c tests/fuzz.c $(FAULT) tests/fault_alloc.h include/rbtree.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SRC) src/pool.c tests/fuzz.c $(FAULT) -o $@
 

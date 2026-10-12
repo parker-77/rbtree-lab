@@ -1,7 +1,37 @@
 # Reflection
 
-Most of my previous coding experience has been with C++, so the handling of pointers was more of a review than anything. Only a few specific cases, like how C handles strings (manipulating `**char`), required closer attention. This allowed me to focus more on the logic of the tree rather than learning about pointers. There were still some surprises, such as the need for `[[maybe unused]]` to suppress compiler warnings, and how the type alias `typedef struct rbtree rbtree_t;` defined in the header file was usable in the implementation file. The C compiler is temperamental, and I was surprised to find what worked and what didn't.
+## Slab Comparison
 
-I also have had previous experience working with LLM coding agents, so working with Claude felt familiar. During my first session, I discovered how eager Claude is to produce code, so I made an effort in future sessions to prompt for specific, incremental changes. I found the agent to be very reliable when I went through every specific case in detail before having it write any code. I in fact never faced a failing `asan` or `valgrind` check because every edit was carefully thought out. I saw how things could have gone differently because, early in M1, the model did produce a lot of code at once, making the model more likely to make mistakes and me more likely to miss those mistakes.
+The biggest difference between my implementation and `kmem_cache_alloc` is that Linux allows the pool to grow AND shrink dynamically. In my implementation, slabs are created when there are no more available slots, but slabs are only freed when the pool is destroyed. In a true operating system, this means a pool could grow very large and stay large even after most of its slots have been freed. Another difference is that `kmem_cache_alloc` includes safeguards for safe concurrency, like disabling interrupts, using per-CPU caches for lockless access, or spinlocks. My implementation has none of this, but assumes the program is single threaded.
 
-The biggest mistake the model made was changing too much at once. I rejected the diff in these cases and asked it to deliver smaller chunks, such as covering deletion cases that require rotations. To my knowledge, this approach helped the model produce bug-free code from beginning to end. The only failing test cases I ever saw were for methods that had not been implemented yet. `asan` and `valgrind` tests never failed (once I worked around my hardware restrictions). If an approach didn't make sense to me, I pushed back during the planning stage. This impressed me greatly, as my previous experience with LLM coding agents had never been so good.
+## `pool_stats` Definitions
+
+`slabs` was renamed to `nslabs` to make its purpose more explicit. It tracks the number of created slabs. `slabs` now refers to the pointer to the next slab in the list.
+`free` is a pointer to the head of the free slot linked list. `free_objs`, renamed to `nfree`, is the number of free slots in the pool. `live` is the number of active slots. `free` is checked first in `pool_alloc`, and if it is null (free list is empty), `grow` is called. If `grow` fails, nothing is changed. 
+`pool_stats` modifies given pointers to hold `nslabs`, `live`, `nfree`. The `live + free_objs == slabs * objs_per_slab` check lives in `test_rbtree.c` as:
+
+```c
+static struct pool_counts pool_check(const rb_pool_t *p) {
+    struct pool_counts c;
+    pool_stats(p, &c.slabs, &c.live, &c.free_objs);
+    CHECK(c.live + c.free_objs == c.slabs * p->per_slab);
+    return c;
+}
+```
+
+## Slab Headers
+
+I chose in-band slab headers over out-of-band. This puts the header at the front of the slab, shifting the first slot's address forward. I chose this for the same reason I chose no parent pointers in the last assignment: to sacrifice convenience to minimize allocations, reducing the failure surface area. I also found it practical because the size of the header was no bigger than the wasted "slack" at the end of the slab, so placing headers in-band actually minimized wasted memory and did not result in a lost slot.
+
+## Alignment
+
+Slabs are defined as:
+
+```c
+struct slab {
+    struct slab *next;                        /* offset 0: next slab in the pool's list */
+    alignas(max_align_t) unsigned char mem[]; /* FAM: slots start at first max_align_t boundary past next */
+};
+```
+
+`pool_create` calculates the size of slots and number of slots per slab given the size of a slab (`SLAB_BYTES`) and the size of a node (`obj_size`). The header (pointer to the next slab) is offset by 0 and is automatically aligned because the slab itself is allocated with `malloc`. The rest of the slab after the header is filled by the `mem` array. Using `alignas(max_align_t)` for this array ensures that the whole slab is properly addressed to satisfy C's alignment requirement. `alignof` is also used when calculating slot sizes to ensure that each element is also aligned correctly. For example, if addresses must be divisible by 16, then nodes of size 15 would fall out of alignment. The pool rounds this up to 16 to keep them aligned.

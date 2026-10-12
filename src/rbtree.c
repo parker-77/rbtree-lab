@@ -1,11 +1,17 @@
 #include "rbtree.h"
-#include "pool.h"
 #include "../tests/fault_alloc.h"
 
 #include <assert.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Slab pool, defined in src/pool.c: only the calls the tree makes. */
+typedef struct rb_pool rb_pool_t;
+rb_pool_t *pool_create(size_t obj_size);
+void *pool_alloc(rb_pool_t *p);
+void pool_free(rb_pool_t *p, void *obj);
+void pool_destroy(rb_pool_t *p);
 
 typedef enum { RED, BLACK } rb_color_t;
 
@@ -39,6 +45,8 @@ struct destroy_ctx {
 /* Internal helpers; defined below the public API they support. Every helper
  * that allocates or frees a node takes the tree's pool. */
 static struct rb_node *new_node(const char *key, void *value, rb_pool_t *pool);
+static void free_node(struct rb_node *n, rb_value_free_fn value_free,
+                      rb_pool_t *pool);
 static int key_compare(const struct rb_node *n, const char *key);
 static bool is_red(const struct rb_node *n);
 static struct rb_node *rotate_left(struct rb_node *n);
@@ -209,6 +217,18 @@ cleanup_key:
     return NULL;
 }
 
+/* Inverse of new_node: releases n's value (only if the tree owns values),
+ * its key copy, and its pool slot. The caller must have read anything it
+ * still needs from n (color, children) first. */
+static void free_node(struct rb_node *n, rb_value_free_fn value_free,
+                      rb_pool_t *pool) {
+    if (value_free != NULL) {
+        value_free(n->value); /* tree relinquishes ownership of value */
+    }
+    rb_free(n->key);    /* node's key copy freed */
+    pool_free(pool, n); /* node slot returns to the pool */
+}
+
 /* Compares key against n->key using strcmp's convention: negative means key
  * belongs left of n, positive means right, zero means key matches n. Shared
  * directional check for insert/delete traversal. */
@@ -330,9 +350,11 @@ static struct rb_node *insert_rec(struct rb_node *n, const char *key,
         n->right = new_right;
     } else {
         /* key already exists: free the old value (if the tree owns values),
-         * then the node takes ownership of the new one in its place. No
-         * allocation or structural change, so no fixup is needed. */
-        if (value_free != NULL) {
+         * then the node takes ownership of the new one in its place. If the
+         * caller passed back the pointer the node already owns, nothing
+         * changes hands, so nothing is freed. No allocation or structural
+         * change, so no fixup is needed. */
+        if (value_free != NULL && n->value != value) {
             value_free(n->value);
         }
         n->value = value;
@@ -567,11 +589,7 @@ static struct rb_node *delete_rec(struct rb_node *n, const char *key,
 
     if (n->left == NULL && n->right == NULL) {
         bool was_black = (n->color == BLACK);
-        if (value_free != NULL) {
-            value_free(n->value);
-        }
-        rb_free(n->key);
-        pool_free(pool, n); /* leaf's node struct freed; no children to preserve */
+        free_node(n, value_free, pool); /* leaf freed; no children to preserve */
         *shorter = was_black;
         return NULL;
     }
@@ -579,11 +597,7 @@ static struct rb_node *delete_rec(struct rb_node *n, const char *key,
     /* Exactly one child. A black node with one child always has a single red
      * leaf child (see plan); a red node can never have exactly one child. */
     struct rb_node *child = (n->left != NULL) ? n->left : n->right;
-    if (value_free != NULL) {
-        value_free(n->value);
-    }
-    rb_free(n->key);
-    pool_free(pool, n); /* n's node struct freed; child subtree reattached in its place */
+    free_node(n, value_free, pool); /* n freed; child subtree reattached in its place */
     child->color = BLACK;
     *shorter = false;
     return child;
@@ -654,11 +668,7 @@ static void foreach_visit(struct rb_node *n, void *ctx) {
  * it lived in a predecessor that was freed already. */
 static void destroy_visit(struct rb_node *n, void *ctx) {
     struct destroy_ctx *dc = ctx;
-    if (dc->value_free != NULL) {
-        dc->value_free(n->value); /* tree relinquishes ownership of value */
-    }
-    rb_free(n->key);
-    pool_free(dc->pool, n); /* tree relinquishes ownership of the node itself */
+    free_node(n, dc->value_free, dc->pool); /* tree relinquishes n, its key and (if owned) its value */
 }
 
 /* Returns this subtree's black-height (>= 0), or -1 if a violation was found
