@@ -1,7 +1,7 @@
 CC           := gcc
 OPT          ?= -O1
 EXTRA_CFLAGS ?=
-CFLAGS       := -std=c23 -Wall -Wextra -Werror -g $(OPT) -Iinclude $(EXTRA_CFLAGS)
+CFLAGS       := -std=c23 -Wall -Wextra -Werror -g $(OPT) -Iinclude -Itests $(EXTRA_CFLAGS)
 
 SRC     := src/rbtree.c
 TSRC    := tests/test_rbtree.c

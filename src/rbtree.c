@@ -1,5 +1,5 @@
 #include "rbtree.h"
-#include "../tests/fault_alloc.h"
+#include "fault_alloc.h"
 
 #include <assert.h>
 #include <stdbool.h>

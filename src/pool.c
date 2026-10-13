@@ -1,6 +1,6 @@
 #include <stddef.h>
 
-#include "../tests/fault_alloc.h"
+#include "fault_alloc.h"
 
 typedef struct rb_pool rb_pool_t;
 
