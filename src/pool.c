@@ -1,4 +1,5 @@
 #include <stddef.h>
+#include <string.h>
 
 #include "fault_alloc.h"
 
@@ -19,6 +20,7 @@ void pool_stats(const rb_pool_t *p, size_t *slabs, size_t *live, size_t *free_ob
 void pool_destroy(rb_pool_t *p);
 
 #define SLAB_BYTES ((size_t)4096)
+#define POOL_POISON 0xDD /* fills every free slot past its free-list link */
 
 /* Overlays a free slot: the link occupies the slot's first bytes (intrusive). */
 struct free_slot {
@@ -41,6 +43,14 @@ struct rb_pool {
     size_t nfree;           /* slots on the free list; invariant: live + nfree == nslabs * per_slab */
 };
 
+/* Fills every byte of slot past its free-list link with POOL_POISON, so a
+ * dangling read sees 0xDD bytes instead of a node's old contents. The link's
+ * bytes belong to the pool and are left alone. */
+static void poison(const struct rb_pool *p, struct free_slot *slot) {
+    memset((unsigned char *)slot + sizeof *slot, POOL_POISON,
+           p->slot_size - sizeof *slot);
+}
+
 /* Rounds n up to a multiple of a; the bit trick is valid because a is a power of two. */
 static size_t round_up(size_t n, size_t a) {
     return (n + a - 1) & ~(a - 1);
@@ -59,6 +69,7 @@ static bool grow(struct rb_pool *p) {
      * invariant: slots i+1..per_slab-1 are on the free list, lowest address first */
     for (size_t i = p->per_slab; i-- > 0;) {
         struct free_slot *slot = (void *)&s->mem[i * p->slot_size];
+        poison(p, slot); /* fresh slots look exactly like recycled ones */
         slot->next = p->free;
         p->free = slot;
     }
@@ -109,6 +120,7 @@ void pool_free(rb_pool_t *p, void *obj) {
         return;
     }
     struct free_slot *slot = obj;
+    poison(p, slot);      /* past the link: the caller's data is gone */
     slot->next = p->free; /* push: O(1); LIFO, so this slot is reused next */
     p->free = slot;       /* pool reclaims ownership of the slot */
     p->live--;

@@ -27,7 +27,8 @@ struct rbtree {
     struct rb_node *root;
     rb_value_free_fn value_free; /* may be NULL: values not owned */
     size_t size;                 /* count of distinct keys */
-    rb_pool_t *pool;             /* sole source of node storage; never NULL */
+    rb_pool_t *pool;             /* pooled tree: sole source of node storage;
+                                    plain tree: NULL, nodes come from rb_malloc */
 };
 
 /* Visitor contexts for morris_inorder: foreach_ctx adapts rb_foreach's
@@ -47,6 +48,7 @@ struct destroy_ctx {
 static struct rb_node *new_node(const char *key, void *value, rb_pool_t *pool);
 static void free_node(struct rb_node *n, rb_value_free_fn value_free,
                       rb_pool_t *pool);
+static void release_slot(struct rb_node *n, rb_pool_t *pool);
 static int key_compare(const struct rb_node *n, const char *key);
 static bool is_red(const struct rb_node *n);
 static struct rb_node *rotate_left(struct rb_node *n);
@@ -71,9 +73,18 @@ static void destroy_visit(struct rb_node *n, void *ctx);
 static int validate_rec(const struct rb_node *n, const char **prev_key,
                          size_t *count, int *error);
 
-/* Every tree is pooled: node storage always comes from the tree's pool. */
+/* Allocates an empty plain tree: every node is its own rb_malloc block.
+ * Returns NULL on allocation failure (nothing was allocated). */
 rbtree_t *rb_create(rb_value_free_fn value_free) {
-    return rb_create_pooled(value_free);
+    struct rbtree *t = rb_malloc(sizeof *t);
+    if (t == NULL) {
+        return NULL;
+    }
+    t->root = NULL;
+    t->value_free = value_free;
+    t->size = 0;
+    t->pool = NULL; /* plain tree: fixed for its whole life */
+    return t;
 }
 
 /* Allocates an empty tree and the slab pool its node structs come from.
@@ -183,15 +194,16 @@ void rb_destroy(rbtree_t *t) {
     }
     struct destroy_ctx dc = {.value_free = t->value_free, .pool = t->pool};
     morris_inorder(t->root, true, destroy_visit, &dc); /* tree relinquishes every node */
-    pool_destroy(t->pool); /* every slab and the pool itself freed */
+    pool_destroy(t->pool); /* pooled: every slab and the pool freed; plain: no-op */
     rb_free(t);
 }
 
-/* Allocates a new red leaf node from pool, copying key. Returns NULL on
- * allocation failure (nothing allocated survives such a failure). The key
- * copy is taken first: pool_alloc may grow the pool, which a later failure
- * couldn't undo, so it goes last and a failed insert leaves the pool's
- * counters untouched. */
+/* Allocates a new red leaf node, copying key. The node comes from pool, or
+ * from rb_malloc when pool is NULL (a plain tree); a pooled tree never falls
+ * back to the heap. Returns NULL on allocation failure (nothing allocated
+ * survives such a failure). The key copy is taken first: pool_alloc may grow
+ * the pool, which a later failure couldn't undo, so it goes last and a failed
+ * insert leaves the pool's counters untouched. */
 static struct rb_node *new_node(const char *key, void *value, rb_pool_t *pool) {
     size_t key_len = strlen(key) + 1;
     char *key_copy = rb_malloc(key_len);
@@ -200,7 +212,9 @@ static struct rb_node *new_node(const char *key, void *value, rb_pool_t *pool) {
     }
     memcpy(key_copy, key, key_len);
 
-    struct rb_node *n = pool_alloc(pool); /* caller takes ownership of the slot */
+    /* the tree's mode decides the source; a failed pool_alloc is final */
+    struct rb_node *n = pool != NULL ? pool_alloc(pool) : rb_malloc(sizeof *n);
+    /* caller takes ownership of the node (if non-NULL) */
     if (n == NULL) {
         goto cleanup_key;
     }
@@ -218,15 +232,24 @@ cleanup_key:
 }
 
 /* Inverse of new_node: releases n's value (only if the tree owns values),
- * its key copy, and its pool slot. The caller must have read anything it
+ * its key copy, and its node storage. The caller must have read anything it
  * still needs from n (color, children) first. */
 static void free_node(struct rb_node *n, rb_value_free_fn value_free,
                       rb_pool_t *pool) {
     if (value_free != NULL) {
         value_free(n->value); /* tree relinquishes ownership of value */
     }
-    rb_free(n->key);    /* node's key copy freed */
-    pool_free(pool, n); /* node slot returns to the pool */
+    rb_free(n->key);       /* node's key copy freed */
+    release_slot(n, pool); /* node storage released */
+}
+
+/* Releases only n's own storage, to wherever new_node took it from. */
+static void release_slot(struct rb_node *n, rb_pool_t *pool) {
+    if (pool != NULL) {
+        pool_free(pool, n); /* node slot returns to the pool */
+    } else {
+        rb_free(n); /* plain tree: node block freed */
+    }
 }
 
 /* Compares key against n->key using strcmp's convention: negative means key
@@ -350,11 +373,9 @@ static struct rb_node *insert_rec(struct rb_node *n, const char *key,
         n->right = new_right;
     } else {
         /* key already exists: free the old value (if the tree owns values),
-         * then the node takes ownership of the new one in its place. If the
-         * caller passed back the pointer the node already owns, nothing
-         * changes hands, so nothing is freed. No allocation or structural
-         * change, so no fixup is needed. */
-        if (value_free != NULL && n->value != value) {
+         * then the node takes ownership of the new one in its place. No
+         * allocation or structural change, so no fixup is needed. */
+        if (value_free != NULL) {
             value_free(n->value);
         }
         n->value = value;
@@ -504,7 +525,7 @@ static struct rb_node *extract_min(struct rb_node *n, char **out_key,
         *out_value = n->value; /* ownership transferred to caller */
         struct rb_node *right = n->right;
         bool was_black = (n->color == BLACK);
-        pool_free(pool, n); /* node struct freed; key/value ownership already moved out */
+        release_slot(n, pool); /* node struct freed; key/value ownership already moved out */
 
         if (right != NULL) {
             right->color = BLACK; /* case 6: red child absorbs the black n had */

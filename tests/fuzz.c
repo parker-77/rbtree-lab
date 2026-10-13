@@ -29,8 +29,40 @@ struct model_entry {
 
 static struct model_entry model[NUM_KEYS];
 
-static void free_value(void *value) {
+/* Every operation runs on a plain tree (rb_create) and a pooled tree
+ * (rb_create_pooled), each owning its own value copies, and both are held to
+ * the same model: the two constructors must behave identically. */
+enum { PLAIN, POOLED, NUM_TREES };
+static const char *const tree_name[NUM_TREES] = {"plain", "pooled"};
+
+/* Values each tree has handed to value_free, and how many the header contract
+ * says it should have by now: one per overwrite or delete of a present key,
+ * plus one per key still present at teardown. */
+static unsigned long value_frees[NUM_TREES];
+static unsigned long expected_frees;
+
+static void free_plain_value(void *value) {
+    value_frees[PLAIN]++;
     free(value);
+}
+
+static void free_pooled_value(void *value) {
+    value_frees[POOLED]++;
+    free(value);
+}
+
+/* Exits on the first tree whose destructor count has drifted from the
+ * contract. */
+static void check_value_frees(unsigned long iter) {
+    for (int i = 0; i < NUM_TREES; i++) {
+        if (value_frees[i] != expected_frees) {
+            fprintf(stderr,
+                    "fuzz: %s tree freed %lu values, expected %lu, at "
+                    "iteration %lu\n",
+                    tree_name[i], value_frees[i], expected_frees, iter);
+            exit(EXIT_FAILURE);
+        }
+    }
 }
 
 static void key_for(unsigned index, char *buf, size_t buflen) {
@@ -147,14 +179,16 @@ int main(int argc, char **argv) {
             seed, argv[0], iterations, seed);
     srand(seed);
 
-    rbtree_t *t = rb_create(free_value);
-    if (t == NULL) {
-        fprintf(stderr, "fuzz: rb_create failed\n");
+    rbtree_t *trees[NUM_TREES] = {rb_create(free_plain_value),
+                                  rb_create_pooled(free_pooled_value)};
+    if (trees[PLAIN] == NULL || trees[POOLED] == NULL) {
+        fprintf(stderr, "fuzz: tree creation failed\n");
         return 1;
     }
 
     /* invariant: each pass performs exactly one insert/delete/find against a
-     * uniformly random key, checked against model[] immediately. */
+     * uniformly random key on both trees, checked against model[] immediately,
+     * and expected_frees counts every value the contract has released. */
     for (unsigned long iter = 0; iter < iterations; iter++) {
         unsigned key_idx = (unsigned)rand() % NUM_KEYS;
         char key[KEY_BUF_LEN];
@@ -162,61 +196,87 @@ int main(int argc, char **argv) {
 
         unsigned op = (unsigned)rand() % 10;
         if (op < 4) {
-            int *value = malloc(sizeof(*value));
-            if (value == NULL) {
-                fprintf(stderr, "fuzz: out of memory allocating value\n");
-                return 1;
-            }
-            /* The payload is the iteration, not the key: every insert for a
-             * given key carries a value no earlier insert could have stored,
-             * so an overwrite that keeps the stale value fails the next
-             * rb_find/rb_foreach check instead of comparing equal to itself. */
-            *value = (int)iter;
+            /* invariant: trees[0..i-1] already hold this iteration's value */
+            for (int i = 0; i < NUM_TREES; i++) {
+                int *value = malloc(sizeof(*value));
+                if (value == NULL) {
+                    fprintf(stderr, "fuzz: out of memory allocating value\n");
+                    return 1;
+                }
+                /* The payload is the iteration, not the key: every insert for
+                 * a given key carries a value no earlier insert could have
+                 * stored, so an overwrite that keeps the stale value fails
+                 * the next rb_find/rb_foreach check instead of comparing
+                 * equal to itself. */
+                *value = (int)iter;
 
-            int rc = rb_insert(t, key, value);
-            if (rc == 0) {
-                /* ownership of value transfers to the tree on success, so the
-                 * model records iter directly rather than reading *value */
-                model[key_idx].present = true;
-                model[key_idx].value = (int)iter;
-            } else {
-                fprintf(stderr,
-                        "fuzz: rb_insert unexpectedly failed at iteration %lu\n",
-                        iter);
-                free(value); /* not consumed on failure; still ours to free */
-                return 1;
+                int rc = rb_insert(trees[i], key, value);
+                if (rc != 0) {
+                    fprintf(stderr,
+                            "fuzz: rb_insert unexpectedly failed on the %s "
+                            "tree at iteration %lu\n",
+                            tree_name[i], iter);
+                    free(value); /* not consumed on failure; still ours */
+                    return 1;
+                }
+                /* ownership of value transferred to trees[i] */
             }
+            if (model[key_idx].present) {
+                expected_frees++; /* the overwrite released the old value */
+            }
+            /* the model records iter directly rather than reading *value */
+            model[key_idx].present = true;
+            model[key_idx].value = (int)iter;
         } else if (op < 8) {
             bool should_exist = model[key_idx].present;
-            int rc = rb_delete(t, key);
-            if (rc != (should_exist ? 0 : -1)) {
-                fprintf(stderr,
-                        "fuzz: rb_delete(%s) returned %d, expected %d, at "
-                        "iteration %lu\n",
-                        key, rc, should_exist ? 0 : -1, iter);
-                return 1;
+            /* invariant: trees[0..i-1] have already removed key (or refused) */
+            for (int i = 0; i < NUM_TREES; i++) {
+                int rc = rb_delete(trees[i], key);
+                if (rc != (should_exist ? 0 : -1)) {
+                    fprintf(stderr,
+                            "fuzz: rb_delete(%s) on the %s tree returned %d, "
+                            "expected %d, at iteration %lu\n",
+                            key, tree_name[i], rc, should_exist ? 0 : -1,
+                            iter);
+                    return 1;
+                }
+            }
+            if (should_exist) {
+                expected_frees++; /* the delete released the value */
             }
             model[key_idx].present = false;
         } else {
-            void *value = rb_find(t, key);
-            bool mismatch = model[key_idx].present
-                                 ? (value == NULL ||
-                                    *(int *)value != model[key_idx].value)
-                                 : (value != NULL);
-            if (mismatch) {
-                fprintf(stderr, "fuzz: rb_find(%s) mismatch at iteration %lu\n",
-                        key, iter);
-                return 1;
+            /* invariant: trees[0..i-1] agreed with the model on key */
+            for (int i = 0; i < NUM_TREES; i++) {
+                void *value = rb_find(trees[i], key);
+                bool mismatch = model[key_idx].present
+                                     ? (value == NULL ||
+                                        *(int *)value != model[key_idx].value)
+                                     : (value != NULL);
+                if (mismatch) {
+                    fprintf(stderr,
+                            "fuzz: rb_find(%s) mismatch on the %s tree at "
+                            "iteration %lu\n",
+                            key, tree_name[i], iter);
+                    return 1;
+                }
             }
         }
 
         if ((iter + 1) % VALIDATE_INTERVAL == 0) {
-            validate_against_model(t, iter);
+            validate_against_model(trees[PLAIN], iter);
+            validate_against_model(trees[POOLED], iter);
+            check_value_frees(iter);
         }
     }
-    validate_against_model(t, iterations);
+    validate_against_model(trees[PLAIN], iterations);
+    validate_against_model(trees[POOLED], iterations);
+    check_value_frees(iterations);
 
-    rb_destroy(t); /* frees every remaining node, key copy, and value */
+    expected_frees += rb_size(trees[PLAIN]); /* teardown frees what's left */
+    rb_destroy(trees[PLAIN]);  /* frees every remaining node, key copy, value */
+    rb_destroy(trees[POOLED]); /* same, plus every slab and the pool */
+    check_value_frees(iterations);
 
     printf("fuzz: %lu operations OK\n", iterations);
     return 0;

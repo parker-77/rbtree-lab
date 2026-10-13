@@ -57,9 +57,9 @@ static rb_pool_t *test_pool;
 
 /* When false, checked_alloc/checked_free skip straight to the pool and
  * checked_destroy keeps only its O(1) leak check: the per-call checks scan
- * every slab, far too slow for the million-node small-stack tests. Only
- * flip it for a tree's whole life (create through destroy): a slot freed
- * unchecked is never poisoned, so a checked alloc would then misreport it. */
+ * every slab, far too slow for the million-node small-stack tests. Flip it
+ * only for a tree's whole life (create through destroy), so the counter
+ * checks never straddle calls that skipped them. */
 static bool pool_checks = true;
 
 #define CHECK(cond)                                                    \
@@ -427,6 +427,21 @@ static void test_rb_create_sets_fields(void) {
     CHECK(t->root == NULL);
     CHECK(t->value_free == NULL);
     CHECK(t->size == 0);
+    CHECK(t->pool == NULL); /* plain tree: nodes come from rb_malloc */
+
+    rb_destroy(t);
+}
+
+static void test_rb_create_pooled_sets_fields(void) {
+    rbtree_t *t = rb_create_pooled(NULL);
+    CHECK(t != NULL);
+    if (t == NULL) {
+        return;
+    }
+    CHECK(t->root == NULL);
+    CHECK(t->value_free == NULL);
+    CHECK(t->size == 0);
+    CHECK(t->pool != NULL); /* pooled tree: every node comes from t->pool */
 
     rb_destroy(t);
 }
@@ -473,9 +488,11 @@ static void test_rb_insert_overwrite_frees_old_value(void) {
     rb_destroy(t);
 }
 
-/* Re-inserting the pointer a key already holds must not free it: the node
- * keeps owning the same value, so it is released once, by rb_destroy. */
-static void test_rb_insert_same_value_twice_frees_nothing(void) {
+/* The header contract has no same-pointer exception: overwriting a key
+ * frees the old value via value_free even when the caller passes back the
+ * pointer the node already holds. (With a real destructor that leaves the
+ * node holding a freed value -- the caller's error under the contract.) */
+static void test_rb_insert_same_value_twice_frees_old_once(void) {
     rbtree_t *t = rb_create(counting_value_free);
     CHECK(t != NULL);
     if (t == NULL) {
@@ -485,42 +502,13 @@ static void test_rb_insert_same_value_twice_frees_nothing(void) {
 
     CHECK(rb_insert(t, "key", (void *)0x1) == 0);
     CHECK(rb_insert(t, "key", (void *)0x1) == 0);
-    CHECK(free_call_count == 0); /* same pointer: nothing was replaced */
+    CHECK(free_call_count == 1); /* the overwrite released the old value */
     CHECK(rb_find(t, "key") == (void *)0x1);
     CHECK(rb_size(t) == 1);
     CHECK(rb_validate(t) == 0);
 
     rb_destroy(t);
-    CHECK(free_call_count == 1); /* released exactly once, at destroy */
-}
-
-/* Same as above with a real heap value, so a free-then-store bug shows up
- * as a use-after-free / double free under ASan and Valgrind. */
-static void test_rb_insert_same_malloced_value_twice(void) {
-    rbtree_t *t = rb_create(free);
-    CHECK(t != NULL);
-    if (t == NULL) {
-        return;
-    }
-    int *v = malloc(sizeof *v);
-    CHECK(v != NULL);
-    if (v == NULL) {
-        rb_destroy(t);
-        return;
-    }
-    *v = 42;
-
-    CHECK(rb_insert(t, "key", v) == 0); /* tree takes ownership of v */
-    if (rb_insert(t, "key", v) != 0) {
-        CHECK(false); /* no allocation on overwrite, so this can't fail */
-    }
-    int *found = rb_find(t, "key");
-    CHECK(found == v);
-    if (found != NULL) {
-        CHECK(*found == 42); /* still live: reading it is not a use-after-free */
-    }
-
-    rb_destroy(t); /* frees v exactly once */
+    CHECK(free_call_count == 2); /* plus the one teardown releases */
 }
 
 /* --- rb_size ------------------------------------------------------------- */
@@ -680,6 +668,121 @@ static void test_rb_destroy_frees_all_values(void) {
 
 static void test_rb_destroy_null_is_noop(void) {
     rb_destroy(NULL); /* must not crash */
+}
+
+/* --- plain vs pooled ------------------------------------------------------
+ * The two constructors must give trees that behave identically; only where
+ * node storage comes from differs. Values are fake pointers, so each tree's
+ * destructor only counts. */
+
+#define MATCH_KEYS 6000
+#define MATCH_OPS 20000
+#define MATCH_KEY_LEN 8 /* "%06u" of at most MATCH_KEYS - 1, plus NUL */
+
+static size_t plain_value_frees = 0;
+static size_t pooled_value_frees = 0;
+
+static void count_plain_free(void *value) {
+    (void)value;
+    plain_value_frees++;
+}
+
+static void count_pooled_free(void *value) {
+    (void)value;
+    pooled_value_frees++;
+}
+
+static void match_key(unsigned k, char key[MATCH_KEY_LEN]) {
+    snprintf(key, MATCH_KEY_LEN, "%06u", k);
+}
+
+/* Inserts keys 0..MATCH_KEYS-1 into t, each holding value k + 1. Returns how
+ * many rb_malloc requests that took. */
+static long match_fill(rbtree_t *t) {
+    long before = fault_alloc_total();
+    char key[MATCH_KEY_LEN];
+    /* invariant: keys 0..k-1 are in t, each holding value k + 1 */
+    for (unsigned k = 0; k < MATCH_KEYS; k++) {
+        match_key(k, key);
+        CHECK(rb_insert(t, key, (void *)(uintptr_t)(k + 1)) == 0);
+    }
+    return fault_alloc_total() - before;
+}
+
+/* The same fill, churn and teardown on a plain and a pooled tree: equal
+ * results from every call, destructor counts that match each other and the
+ * header contract (every overwrite and delete of a present key releases one
+ * value, teardown one per remaining key), and the allocation
+ * pattern each constructor promises (plain: key copy + node per key;
+ * pooled: key copy per key, plus one slab per slab's worth of nodes). */
+static void test_plain_and_pooled_trees_match(void) {
+    plain_value_frees = 0;
+    pooled_value_frees = 0;
+    rbtree_t *plain = rb_create(count_plain_free);
+    rbtree_t *pooled = rb_create_pooled(count_pooled_free);
+    CHECK(plain != NULL && pooled != NULL);
+    if (plain == NULL || pooled == NULL) {
+        rb_destroy(plain);
+        rb_destroy(pooled);
+        return;
+    }
+
+    long plain_allocs = match_fill(plain);
+    long pooled_allocs = match_fill(pooled);
+    size_t slabs = pool_check(pooled->pool).slabs;
+    CHECK(plain_allocs == 2 * MATCH_KEYS);
+    CHECK(pooled_allocs == MATCH_KEYS + (long)slabs);
+
+    static bool present[MATCH_KEYS];
+    for (unsigned k = 0; k < MATCH_KEYS; k++) {
+        present[k] = true; /* match_fill inserted every key */
+    }
+    size_t expected_frees = 0;
+    unsigned rng = 0x9E3779B9u;
+    char key[MATCH_KEY_LEN];
+    /* invariant: plain and pooled have answered every call identically, and
+     * each has released exactly expected_frees values */
+    for (unsigned op = 0; op < MATCH_OPS; op++) {
+        rng = rng * 1664525u + 1013904223u;
+        unsigned k = (rng >> 8) % MATCH_KEYS;
+        unsigned kind = (rng >> 4) % 100;
+        match_key(k, key);
+        if (kind < 60) {
+            /* < 40: the pointer the key held when filled, so an overwrite
+             * may hand back the very value the node owns; otherwise fresh */
+            void *v = kind < 40 ? (void *)(uintptr_t)(k + 1)
+                                : (void *)(uintptr_t)(MATCH_KEYS + op + 1);
+            int rc_plain = rb_insert(plain, key, v);
+            int rc_pooled = rb_insert(pooled, key, v);
+            CHECK(rc_plain == 0 && rc_pooled == 0); /* no faults armed */
+            expected_frees += present[k] ? 1 : 0; /* overwrite frees the old */
+            present[k] = true;
+        } else if (kind < 90) {
+            int rc = rb_delete(plain, key);
+            CHECK(rc == rb_delete(pooled, key));
+            CHECK(rc == (present[k] ? 0 : -1));
+            expected_frees += present[k] ? 1 : 0;
+            present[k] = false;
+        } else {
+            CHECK(rb_find(plain, key) == rb_find(pooled, key));
+        }
+        CHECK(plain_value_frees == expected_frees);
+        CHECK(pooled_value_frees == expected_frees);
+    }
+
+    CHECK(rb_size(plain) == rb_size(pooled));
+    CHECK(rb_validate(plain) == 0 && rb_validate(pooled) == 0);
+    /* invariant: keys 0..k-1 hold the same value (or are absent) in both */
+    for (unsigned k = 0; k < MATCH_KEYS; k++) {
+        match_key(k, key);
+        CHECK(rb_find(plain, key) == rb_find(pooled, key));
+    }
+
+    expected_frees += rb_size(plain); /* teardown frees every remaining value */
+    rb_destroy(plain);  /* plain's nodes, key copies and tree freed */
+    rb_destroy(pooled); /* pooled's key copies, slabs, pool and tree freed */
+    CHECK(plain_value_frees == expected_frees);
+    CHECK(pooled_value_frees == expected_frees);
 }
 
 /* --- rb_validate -----------------------------------------------------
@@ -1381,7 +1484,7 @@ static void test_rb_delete_red_leaves_preserve_order(void) {
 #define SWEEP_KEY_LEN 16
 /* rb_create (tree + pool) + 2 per insert (key copy, and a slab grow at most) */
 #define SWEEP_MAX_ALLOCS (2 + 2 * SWEEP_OPS)
-#define SWEEP_OP_CREATE (-1) /* the rb_create call, as a call index */
+#define SWEEP_OP_CREATE (-1) /* the create call, as a call index */
 #define SWEEP_NO_FAULT (-2)  /* dry run: no call is expected to fail */
 
 /* Everything about one node that a failed call could disturb. */
@@ -1481,11 +1584,13 @@ static void sweep_attribute(long since, int op) {
     }
 }
 
-/* Runs the scenario once. fault_op is the call the armed fault will land in
- * (SWEEP_NO_FAULT for the dry run, which also fills sweep_alloc_op). Returns
- * how many calls reported an allocation failure: rb_create returning NULL,
- * rb_insert returning -1, or rb_delete refusing a key that is present. */
-static int sweep_run(int fault_op) {
+/* Runs the scenario once on a tree from create (rb_create or
+ * rb_create_pooled; the pool-counter checks apply only to a pooled tree).
+ * fault_op is the call the armed fault will land in (SWEEP_NO_FAULT for the
+ * dry run, which also fills sweep_alloc_op). Returns how many calls reported
+ * an allocation failure: create returning NULL, rb_insert returning -1, or
+ * rb_delete refusing a key that is present. */
+static int sweep_run(rbtree_t *(*create)(rb_value_free_fn), int fault_op) {
     struct {
         bool present;
         void *value;
@@ -1503,10 +1608,11 @@ static int sweep_run(int fault_op) {
     }
 
     long allocs_before = fault_alloc_total();
-    rbtree_t *t = rb_create(counting_value_free);
+    rbtree_t *t = create(counting_value_free);
     if (t == NULL) {
         return 1; /* create failed; nothing was allocated that could leak */
     }
+    bool pooled = t->pool != NULL;
     if (dry_run) {
         sweep_attribute(allocs_before, SWEEP_OP_CREATE);
     }
@@ -1521,7 +1627,8 @@ static int sweep_run(int fault_op) {
         int frees_before = free_call_count;
         bool alloc_failed = false;
         int dlive = 0; /* pool slots this call should take (+1) or return (-1) */
-        struct pool_counts pool_before = pool_check(t->pool);
+        struct pool_counts pool_before =
+            pooled ? pool_check(t->pool) : (struct pool_counts){0};
         allocs_before = fault_alloc_total();
 
         if (op == fault_op) {
@@ -1571,7 +1678,7 @@ static int sweep_run(int fault_op) {
             /* same nodes, same key copies, same values, same links and
              * colors, and nothing handed to value_free */
             CHECK(sweep_same(&before, &after));
-            CHECK(free_list_ok(t->pool)); /* failure left every free slot intact */
+            CHECK(!pooled || free_list_ok(t->pool)); /* failure left every free slot intact */
         } else {
             CHECK(!alloc_failed);
         }
@@ -1582,17 +1689,19 @@ static int sweep_run(int fault_op) {
 
         CHECK(rb_validate(t) == 0);
         CHECK(rb_size(t) == model_size);
-        if (dlive < 0) {
-            check_free_delta(t->pool, pool_before);
-        } else {
-            check_alloc_delta(t->pool, pool_before, dlive > 0);
+        if (pooled) {
+            if (dlive < 0) {
+                check_free_delta(t->pool, pool_before);
+            } else {
+                check_alloc_delta(t->pool, pool_before, dlive > 0);
+            }
+            CHECK(pool_check(t->pool).live == rb_size(t)); /* one slot per key */
         }
-        CHECK(pool_check(t->pool).live == rb_size(t)); /* one slot per key */
         if (model_size > peak_size) {
             peak_size = model_size;
         }
     }
-    if (dry_run) {
+    if (dry_run && pooled) {
         /* the scenario really did outgrow one slab */
         CHECK(peak_size > t->pool->per_slab);
         CHECK(pool_check(t->pool).slabs >= 2);
@@ -1606,15 +1715,17 @@ static int sweep_run(int fault_op) {
     }
 
     int frees_before = free_call_count;
-    rb_destroy(t); /* t's nodes, key copies, pool, and tree struct freed;
-                      checked_destroy confirms every slot came back first */
+    rb_destroy(t); /* t's nodes, key copies, pool (if any), and tree struct
+                      freed; checked_destroy confirms every slot came back */
     CHECK(free_call_count == frees_before + (int)model_size);
     return failures_seen;
 }
 
-static void test_fault_sweep(void) {
+/* name labels failure output with the constructor under test. */
+static void test_fault_sweep(rbtree_t *(*create)(rb_value_free_fn),
+                             const char *name) {
     long before = fault_alloc_total();
-    CHECK(sweep_run(SWEEP_NO_FAULT) == 0); /* dry run: nothing may fail */
+    CHECK(sweep_run(create, SWEEP_NO_FAULT) == 0); /* dry run: nothing may fail */
     long total = fault_alloc_total() - before;
     CHECK(total > 0);
     /* every allocation was attributed to the call that made it */
@@ -1630,14 +1741,14 @@ static void test_fault_sweep(void) {
         long start = fault_alloc_total();
 
         fault_alloc_arm(n);
-        int seen = sweep_run(sweep_alloc_op[n - 1]);
+        int seen = sweep_run(create, sweep_alloc_op[n - 1]);
         fault_alloc_disarm();
 
         CHECK(fault_alloc_total() - start >= n); /* the n-th alloc happened */
         CHECK(seen == 1);
         if (failures != failures_before) {
-            fprintf(stderr, "  ^ fault sweep: failed with n=%ld of %ld\n", n,
-                    total);
+            fprintf(stderr, "  ^ fault sweep (%s): failed with n=%ld of %ld\n",
+                    name, n, total);
         }
     }
 }
@@ -1648,10 +1759,11 @@ static void test_fault_sweep(void) {
  * the exact counter change the call must cause. The pointer-validity checks
  * deliberately kept out of pool.c live here instead.
  *
- * Use-after-free detection: every free slot carries POOL_POISON in each byte
- * past its free-list link. checked_free poisons a slot before returning it,
- * checked_alloc poisons a freshly grown slab's other slots, and every slot
- * handed back out is checked for intact poison first -- so any write through
+ * Use-after-free detection: pool.c fills every free slot past its free-list
+ * link with POOL_POISON (0xDD), both when grow adds a slab and when
+ * pool_free takes a slot back. The wrappers never poison anything
+ * themselves; they check that the pool did. Every slot handed back out is
+ * checked for intact poison first -- so any write through
  * a dangling pointer while the slot sat on the free list is caught at reuse
  * (or sooner, by free_list_ok). The sanitizers can't see these writes: the
  * whole slab is one live malloc block. */
@@ -1663,7 +1775,6 @@ static_assert(offsetof(struct slab, mem) % alignof(max_align_t) == 0,
 #define POOL_HEADER offsetof(struct slab, mem)
 #define POOL_MAX_HELD 1024u /* > 2 * per_slab for any obj_size >= 1 */
 #define POOL_SWEEP_OPS 600  /* ~70% allocs: spans at least two slabs */
-#define POOL_POISON 0xDD    /* fill for free slots, past the link */
 
 /* struct pool_counts is defined at the top of the file; the sweep uses it. */
 
@@ -1715,8 +1826,8 @@ static void check_free_delta(const rb_pool_t *p, struct pool_counts b) {
           a.free_objs == b.free_objs + 1);
 }
 
-/* Fills every byte of obj's slot past the free-list link with POOL_POISON;
- * the link's bytes belong to the pool and are left alone. */
+/* Re-poisons obj's slot past the link, the way pool_free does; only for
+ * repairing a slot a test deliberately scribbled on. */
 static void poison_slot(const rb_pool_t *p, void *obj) {
     memset((unsigned char *)obj + sizeof(struct free_slot), POOL_POISON,
            p->slot_size - sizeof(struct free_slot));
@@ -1732,18 +1843,6 @@ static bool poison_intact(const rb_pool_t *p, const void *obj) {
         }
     }
     return true;
-}
-
-/* Poisons every slot of the newest slab except got, which the caller is
- * about to own: fresh free slots then look exactly like recycled ones. */
-static void poison_fresh_slab(const rb_pool_t *p, const void *got) {
-    /* invariant: slots 0..i-1 of the newest slab, other than got, are poisoned */
-    for (size_t i = 0; i < p->per_slab; i++) {
-        void *slot = &p->slabs->mem[i * p->slot_size];
-        if (slot != got) {
-            poison_slot(p, slot);
-        }
-    }
 }
 
 /* Walks the free list without trusting it: each entry must be an owned slot
@@ -1773,17 +1872,15 @@ static void *checked_alloc(rb_pool_t *p) {
     if (got != NULL) {
         CHECK(slot_owned(p, got));
         CHECK((uintptr_t)got % alignof(max_align_t) == 0);
-        if (pool_check(p).slabs > b.slabs) {
-            poison_fresh_slab(p, got); /* got itself was never freed */
-        } else {
-            CHECK(poison_intact(p, got)); /* nothing wrote to it while free */
-        }
+        /* grow poisoned a fresh slot and pool_free a recycled one, so
+         * either way nothing wrote to it while it was free */
+        CHECK(poison_intact(p, got));
     }
     return got; /* caller now owns the slot (if non-NULL) */
 }
 
 /* pool_free wrapped in the same checks; refuses pointers the pool doesn't
- * own, and poisons the slot on its way back. */
+ * own, and confirms pool_free poisoned the slot on its way back. */
 static void checked_free(rb_pool_t *p, void *obj) {
     if (!pool_checks) {
         pool_free(p, obj); /* slot ownership returns to the pool */
@@ -1795,9 +1892,9 @@ static void checked_free(rb_pool_t *p, void *obj) {
         return; /* a foreign pointer would poison the free list */
     }
     struct pool_counts b = pool_check(p);
-    poison_slot(p, obj); /* still ours: mark everything past the link freed */
-    pool_free(p, obj);   /* slot ownership returns to the pool */
+    pool_free(p, obj); /* slot ownership returns to the pool */
     check_free_delta(p, b);
+    CHECK(poison_intact(p, obj)); /* the standard build poisoned it */
 }
 
 /* pool_destroy for pools whose every slot should be back: a live slot is a
@@ -1807,7 +1904,7 @@ static void checked_free(rb_pool_t *p, void *obj) {
 static void checked_destroy(rb_pool_t *p) {
     if (p != NULL) {
         CHECK(pool_check(p).live == 0);
-        CHECK(!pool_checks || free_list_ok(p)); /* unchecked frees left no poison */
+        CHECK(!pool_checks || free_list_ok(p)); /* too slow for the unchecked trees */
     }
     pool_destroy(p); /* every slab and p freed */
 }
@@ -2424,9 +2521,10 @@ static void check_big_destroy(rbtree_t *t) {
 }
 
 /* 2^20 keys inserted in a scrambled order, each owning a malloc'd index. */
-static void test_morris_balanced_tree_on_small_stack(void) {
+static void test_morris_balanced_tree_on_small_stack(
+    rbtree_t *(*create)(rb_value_free_fn)) {
     pool_checks = false; /* this tree's whole life runs unchecked; see pool_checks */
-    rbtree_t *t = rb_create(big_value_free);
+    rbtree_t *t = create(big_value_free); /* rb_create or rb_create_pooled */
     CHECK(t != NULL);
     if (t == NULL) {
         pool_checks = true;
@@ -2468,9 +2566,10 @@ static void test_morris_balanced_tree_on_small_stack(void) {
  * root: not a valid red-black tree, but a valid BST, and the deepest shape
  * possible. Morris threads every node of it (each node's predecessor is its
  * left child). */
-static void test_morris_left_chain_on_small_stack(void) {
+static void test_morris_left_chain_on_small_stack(
+    rbtree_t *(*create)(rb_value_free_fn)) {
     pool_checks = false; /* this tree's whole life runs unchecked; see pool_checks */
-    rbtree_t *t = rb_create(big_value_free);
+    rbtree_t *t = create(big_value_free); /* rb_create or rb_create_pooled */
     CHECK(t != NULL);
     if (t == NULL) {
         pool_checks = true;
@@ -2532,10 +2631,10 @@ int main(void) {
     test_insert_rec_attaches_new_leaf();
     test_insert_rec_two_level_ll_violation();
     test_rb_create_sets_fields();
+    test_rb_create_pooled_sets_fields();
     test_rb_create_stores_value_free();
     test_rb_insert_overwrite_frees_old_value();
-    test_rb_insert_same_value_twice_frees_nothing();
-    test_rb_insert_same_malloced_value_twice();
+    test_rb_insert_same_value_twice_frees_old_once();
     test_rb_size_tracks_distinct_keys();
     test_rb_find_returns_value_for_present_key();
     test_rb_find_returns_null_for_absent_key();
@@ -2544,6 +2643,7 @@ int main(void) {
     test_rb_foreach_on_empty_tree_does_nothing();
     test_rb_destroy_frees_all_values();
     test_rb_destroy_null_is_noop();
+    test_plain_and_pooled_trees_match();
     test_rb_validate_valid_tree_is_zero();
     test_rb_validate_empty_tree_is_zero();
     test_rb_validate_detects_red_root();
@@ -2574,7 +2674,8 @@ int main(void) {
     test_fixup_right_deficit_case_d_red_near_nephew();
     test_fixup_left_deficit_case_d_red_near_nephew();
     test_delete_rec_black_leaf_no_black_sibling_case_7();
-    test_fault_sweep();
+    test_fault_sweep(rb_create, "rb_create");
+    test_fault_sweep(rb_create_pooled, "rb_create_pooled");
     test_pool_create_rejects_bad_sizes();
     test_pool_create_geometry();
     test_pool_alloc_grows_and_reuses_lifo();
@@ -2585,8 +2686,10 @@ int main(void) {
     test_pool_poison_detects_write_after_free();
     test_pool_fault_sweep();
     test_rb_pool_live_tracks_size();
-    test_morris_balanced_tree_on_small_stack();
-    test_morris_left_chain_on_small_stack();
+    test_morris_balanced_tree_on_small_stack(rb_create);
+    test_morris_balanced_tree_on_small_stack(rb_create_pooled);
+    test_morris_left_chain_on_small_stack(rb_create);
+    test_morris_left_chain_on_small_stack(rb_create_pooled);
 
     /* every node a node-level test built went back, and no free slot was
      * written after its free */
